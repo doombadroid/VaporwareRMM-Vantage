@@ -89,6 +89,7 @@ func newAppForTest(t *testing.T) *fiber.App {
 	}
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	handlers.RegisterPublicRoutes(app)
+	handlers.RegisterEdgeRoutes(app)
 	api := app.Group("/api/v1", auth.AuthMiddleware(), auth.CSRFMiddleware())
 	handlers.RegisterAuthedRoutes(api)
 	return app

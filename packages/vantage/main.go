@@ -87,6 +87,7 @@ func main() {
 	}))
 
 	handlers.RegisterPublicRoutes(app)
+	handlers.RegisterEdgeRoutes(app)
 	api := app.Group("/api/v1", auth.AuthMiddleware(), auth.CSRFMiddleware())
 	handlers.RegisterAuthedRoutes(api)
 
