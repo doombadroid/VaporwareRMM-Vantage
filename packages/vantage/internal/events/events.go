@@ -112,6 +112,39 @@ func nullable(s string) interface{} {
 	return s
 }
 
+// RecordAuditCheckpoint persists a counterparty's audit-chain head
+// for cross-attestation. Called from /api/edge/poll, /api/edge/
+// register, and /api/edge/events with the head Edge reported plus
+// a "during" tag identifying which exchange produced the record.
+//
+// Fire-and-forget like AuditLog. The checkpoint table is append-only
+// by convention; the verification CLI (Q9 v1.1) reads it linearly
+// to detect tampering — silent write failures here are exactly the
+// gap cross-attestation is meant to plug, so they get slog.Error.
+func RecordAuditCheckpoint(counterpartyType, counterpartyID string, chainSeq int64, signature, duringEvent string) {
+	go RecordAuditCheckpointSync(counterpartyType, counterpartyID, chainSeq, signature, duringEvent)
+}
+
+// RecordAuditCheckpointSync is the synchronous variant for code
+// paths that need the row durable before returning (so the operator
+// or test observes the checkpoint immediately).
+func RecordAuditCheckpointSync(counterpartyType, counterpartyID string, chainSeq int64, signature, duringEvent string) {
+	if _, err := db.DB.Exec(
+		`INSERT INTO audit_checkpoints
+		     (counterparty_type, counterparty_id, chain_seq, signature, recorded_at, recorded_during)
+		     VALUES ($1, $2, $3, $4, $5, $6)`,
+		counterpartyType, nullable(counterpartyID), chainSeq, signature, time.Now().Unix(), nullable(duringEvent),
+	); err != nil {
+		slog.Error("audit_checkpoint: write failed",
+			"error", err,
+			"counterparty_type", counterpartyType,
+			"counterparty_id", counterpartyID,
+			"chain_seq", chainSeq,
+			"during", duringEvent,
+		)
+	}
+}
+
 // WSBroadcastMessage is the placeholder for the F2 real-time fan-out.
 // F1 logs the payload at info level so the call sites are exercised
 // (and the contract is visible in commit-history grep) without
