@@ -5,8 +5,10 @@
 // The audit chain mirrors Edge's pattern from PR #5 / Codex #6:
 //
 //   - Each row carries chain_seq (monotonic, gap-free per chain) and
-//     chain_hash (HMAC-SHA256(SECRETS_ENCRYPTION_KEY, previous_hash
-//     || canonical(row))).
+//     signature (HMAC-SHA256(SECRETS_ENCRYPTION_KEY, previous_signature
+//     || canonical(row))). Edge's audit_logs table uses the same
+//     column name so the cross-system verification CLI (Q9 v1.1) can
+//     read both chains without dialect translation.
 //   - Within-process serialization via auditChainMu so concurrent
 //     callers see a well-defined chain. Postgres handles
 //     cross-instance serialization via row-level locking in F2 when
@@ -52,18 +54,18 @@ func AuditLogSync(userID, action, resourceType, resourceID, details, ip string) 
 	auditChainMu.Lock()
 	defer auditChainMu.Unlock()
 
-	prevSeq, prevHash, err := loadChainHead()
+	prevSeq, prevSignature, err := loadChainHead()
 	if err != nil {
 		slog.Warn("audit: failed to load chain head; row will write but chain may be discontinuous", "error", err)
 	}
 	seq := prevSeq + 1
 	canonical := canonicalRow(seq, userID, action, resourceType, resourceID, details, ip, time.Now().Unix())
-	chainHash := crypto.HMACSHA256("audit", prevHash+"|"+canonical)
+	signature := crypto.HMACSHA256("audit", prevSignature+"|"+canonical)
 
 	if _, err := db.DB.Exec(
-		`INSERT INTO audit_log (chain_seq, chain_hash, user_id, action, resource_type, resource_id, details, ip)
+		`INSERT INTO audit_log (chain_seq, signature, user_id, action, resource_type, resource_id, details, ip)
 		   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		seq, chainHash, nullable(userID), action, resourceType, nullable(resourceID), nullable(details), nullable(ip),
+		seq, signature, nullable(userID), action, resourceType, nullable(resourceID), nullable(details), nullable(ip),
 	); err != nil {
 		slog.Error("audit: write failed",
 			"error", err,
@@ -74,22 +76,22 @@ func AuditLogSync(userID, action, resourceType, resourceID, details, ip string) 
 	}
 }
 
-// loadChainHead returns the highest (chain_seq, chain_hash) pair
+// loadChainHead returns the highest (chain_seq, signature) pair
 // currently in the table, or (0, "") if the table is empty (the
-// genesis-row case). The HMAC over prev_hash="" + canonical(row=1)
-// is the genesis hash for the chain.
+// genesis-row case). The HMAC over prev_signature="" + canonical(row=1)
+// is the genesis signature for the chain.
 func loadChainHead() (int64, string, error) {
 	var seq sql.NullInt64
-	var hash sql.NullString
-	err := db.DB.QueryRow(`SELECT chain_seq, chain_hash FROM audit_log ORDER BY chain_seq DESC LIMIT 1`).
-		Scan(&seq, &hash)
+	var signature sql.NullString
+	err := db.DB.QueryRow(`SELECT chain_seq, signature FROM audit_log ORDER BY chain_seq DESC LIMIT 1`).
+		Scan(&seq, &signature)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", nil
 	}
 	if err != nil {
 		return 0, "", err
 	}
-	return seq.Int64, hash.String, nil
+	return seq.Int64, signature.String, nil
 }
 
 // canonicalRow renders the audit row as a deterministic byte
