@@ -1,0 +1,43 @@
+# Vantage Caddyfile. Single domain — Vantage is one logical service
+# per MSP, not multi-tenant subdomains like Edge. F2-F8 may add
+# tenant-scoped subdomains for drill-through; until then this is
+# flat.
+#
+# DOMAIN          base hostname (e.g. vantage.example.com). localhost
+#                 in dev.
+# ACME_EMAIL      Let's Encrypt contact.
+
+{
+    email {$ACME_EMAIL:admin@localhost}
+}
+
+{$DOMAIN:localhost} {
+    encode gzip
+
+    handle /api/* {
+        reverse_proxy vantage:9090
+    }
+
+    handle /health {
+        reverse_proxy vantage:9090
+    }
+
+    handle {
+        reverse_proxy dashboard:3001
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        -Server
+    }
+
+    log {
+        output stdout
+        format console
+        level INFO
+    }
+}
