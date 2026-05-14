@@ -42,6 +42,7 @@ func RegisterPublicRoutes(app *fiber.App) {
 func RegisterAuthedRoutes(g fiber.Router) {
 	g.Get("/users/me", currentUserHandler)
 	g.Get("/edges", listEdgesHandler)
+	RegisterTailscaleRoutes(g)
 }
 
 func healthHandler(c *fiber.Ctx) error {
