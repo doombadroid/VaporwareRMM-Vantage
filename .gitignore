@@ -1,0 +1,19 @@
+# Build artifacts
+bin/
+dist/
+*.test
+*.out
+
+# Go
+vendor/
+
+# Node
+node_modules/
+.next/
+.turbo/
+
+# Local
+.env
+.env.local
+*.log
+.DS_Store
