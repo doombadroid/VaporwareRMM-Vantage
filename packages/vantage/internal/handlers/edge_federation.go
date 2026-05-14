@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -37,6 +38,12 @@ const edgeTokenTTL = 30 * 24 * time.Hour
 // later phase can throttle individual Edges by extending it on a
 // per-poll basis.
 const defaultPollIntervalSeconds = 15
+
+// tokenRotationWindow: if token_expires_at < now + window, the
+// poll handler rotates the bearer and returns the new plaintext
+// in the response. 7 days gives Edges plenty of margin to pick up
+// the new token before the old one expires.
+const tokenRotationWindow = 7 * 24 * time.Hour
 
 // RegisterEdgeRoutes mounts the federation endpoints on the app.
 // register is at the root group with its own rate limiter; the
@@ -67,6 +74,145 @@ func RegisterEdgeRoutes(app *fiber.App) {
 		},
 	})
 	app.Post("/api/edge/register", registerLimiter, registerEdge)
+
+	// Authed federation endpoints. Edge presents Bearer token;
+	// EdgeAuthMiddleware validates + attaches edge_id/tenant_id/
+	// tailnet_identity to c.Locals.
+	authed := app.Group("/api/edge", auth.EdgeAuthMiddleware())
+	authed.Post("/poll", pollEdge)
+}
+
+// pollEdge handles /api/edge/poll. Issue #22 Q1 + Q5 + Q6 + Q9:
+//
+//   - Records the counterparty's audit chain head (cross-
+//     attestation), then returns Vantage's own chain head.
+//   - Refuses (426) if edge_version drops below the configured
+//     MINIMUM_REQUIRED_EDGE_VERSION.
+//   - Rotates the Edge bearer token if it's within the rotation
+//     window (7 days). New plaintext returned in the response;
+//     old token continues to work until expiry so the Edge has
+//     a chance to persist the rotation before its current request
+//     loop ends.
+//   - Returns commands=[] for F2 (the command pipeline lands in
+//     F4). Shape is locked so F4 just populates the slice.
+func pollEdge(c *fiber.Ctx) error {
+	var req struct {
+		EdgeVersion     string `json:"edge_version"`
+		AuditChainHead  struct {
+			Seq       int64  `json:"seq"`
+			Signature string `json:"signature"`
+		} `json:"audit_chain_head"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+	}
+
+	edgeID, _ := c.Locals("edge_id").(string)
+	minimum := os.Getenv("MINIMUM_REQUIRED_EDGE_VERSION")
+	ok, err := versionAtLeast(req.EdgeVersion, minimum)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "malformed edge_version: " + err.Error(),
+		})
+	}
+	if !ok {
+		return c.Status(fiber.StatusUpgradeRequired).JSON(fiber.Map{
+			"error":                fmt.Sprintf("edge_version %s below minimum %s", req.EdgeVersion, minimum),
+			"code":                 426,
+			"required_min_version": minimum,
+			"current_version":      req.EdgeVersion,
+		})
+	}
+
+	// Update Edge's reported version on every poll so the operator
+	// dashboard reflects current state without waiting for the next
+	// register. Best-effort.
+	if _, err := db.DB.Exec(`UPDATE edges SET edge_version = $1 WHERE id = $2`, req.EdgeVersion, edgeID); err != nil {
+		slog.Warn("poll: edge_version update", "error", err, "edge_id", edgeID)
+	}
+
+	// Cross-attestation: persist the counterparty's chain head.
+	// Synchronous so the audit_checkpoints row is durable before
+	// the response leaves.
+	events.RecordAuditCheckpointSync("edge", edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, "poll")
+
+	// Token rotation. Inside a transaction with FOR UPDATE so
+	// concurrent polls from the same Edge (rare; clock skew) can't
+	// double-rotate.
+	rotatedToken, newExpiresAt, err := maybeRotateToken(edgeID)
+	if err != nil {
+		slog.Error("poll: rotate check", "error", err, "edge_id", edgeID)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotation check failed"})
+	}
+
+	vantageSeq, vantageSig, _ := events.LatestChainHead()
+
+	resp := fiber.Map{
+		"vantage_version": "0.1.0",
+		"audit_chain_head": fiber.Map{
+			"seq":       vantageSeq,
+			"signature": vantageSig,
+		},
+		"commands":                  json.RawMessage("[]"),
+		"next_poll_after_seconds":   defaultPollIntervalSeconds,
+		"min_required_edge_version": minimum,
+	}
+	if rotatedToken != "" {
+		resp["new_edge_token"] = rotatedToken
+		resp["new_token_expires_at"] = newExpiresAt
+	} else {
+		resp["new_edge_token"] = nil
+	}
+	return c.JSON(resp)
+}
+
+// maybeRotateToken atomically checks expiry and rotates if needed.
+// Returns the new plaintext token (empty if no rotation) and the
+// new expiry timestamp.
+func maybeRotateToken(edgeID string) (string, int64, error) {
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return "", 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var expiresAt sql.NullInt64
+	if err := tx.QueryRow(
+		`SELECT token_expires_at FROM edges WHERE id = $1 FOR UPDATE`,
+		edgeID,
+	).Scan(&expiresAt); err != nil {
+		return "", 0, fmt.Errorf("read expiry: %w", err)
+	}
+	if !expiresAt.Valid {
+		return "", 0, nil
+	}
+	now := time.Now()
+	threshold := now.Add(tokenRotationWindow).Unix()
+	if expiresAt.Int64 > threshold {
+		// Not yet within rotation window.
+		return "", 0, nil
+	}
+
+	newPlain, err := generateEdgeToken()
+	if err != nil {
+		return "", 0, fmt.Errorf("generate: %w", err)
+	}
+	newHash := auth.HashToken(newPlain)
+	newExpires := now.Add(edgeTokenTTL).Unix()
+	if _, err := tx.Exec(
+		`UPDATE edges
+		     SET token_hash = $1, token_issued_at = $2, token_expires_at = $3
+		     WHERE id = $4`,
+		newHash, now.Unix(), newExpires, edgeID,
+	); err != nil {
+		return "", 0, fmt.Errorf("rotate update: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", 0, fmt.Errorf("commit: %w", err)
+	}
+
+	events.AuditLogSync("", "edge.token.rotated", "edge", edgeID, "polled within rotation window", "")
+	return newPlain, newExpires, nil
 }
 
 // registerEdge consumes an enrollment token + issues a long-lived

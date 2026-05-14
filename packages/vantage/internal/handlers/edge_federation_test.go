@@ -283,3 +283,159 @@ func TestEdgeRegister_AtomicityOnInsertFailure(t *testing.T) {
 		t.Error("failed register must NOT mark enrollment consumed (transaction atomicity)")
 	}
 }
+
+// seedEdgeForPoll inserts an active edge row with a known token,
+// returning the plaintext for use in poll-request Authorization.
+func seedEdgeForPoll(t *testing.T, id, tenantID string, expiryFromNow time.Duration) string {
+	t.Helper()
+	plain := "vet_test_" + id + "_polltok"
+	hash := auth.HashToken(plain)
+	now := time.Now().Unix()
+	expiry := now + int64(expiryFromNow.Seconds())
+	if _, err := db.DB.Exec(
+		`INSERT INTO edges
+		     (id, tenant_id, token_hash, token_issued_at, token_expires_at,
+		      edge_version, status, last_seen_at, created_at)
+		     VALUES ($1, $2, $3, $4, $5, '0.1.0', 'active', $6, $7)`,
+		id, tenantID, hash, now, expiry, now, now,
+	); err != nil {
+		t.Fatalf("seed edge: %v", err)
+	}
+	return plain
+}
+
+func postEdgePoll(t *testing.T, app *fiber.App, token string, body interface{}) *http.Response {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/api/edge/poll", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	return resp
+}
+
+func TestEdgePoll_HappyPath_NoRotation(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-poll-1", "tenant-1", 25*24*time.Hour) // 25d > 7d window
+
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(7),
+			"signature": "edgesig-7",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d body=%s", resp.StatusCode, body)
+	}
+	var out struct {
+		VantageVersion       string         `json:"vantage_version"`
+		AuditChainHead       map[string]any `json:"audit_chain_head"`
+		Commands             []any          `json:"commands"`
+		NewEdgeToken         *string        `json:"new_edge_token"`
+		NextPollAfterSeconds int            `json:"next_poll_after_seconds"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.VantageVersion == "" {
+		t.Error("vantage_version should be populated")
+	}
+	if out.Commands == nil {
+		t.Error("commands should be [] not null")
+	}
+	if len(out.Commands) != 0 {
+		t.Errorf("commands should be empty in F2, got %d", len(out.Commands))
+	}
+	if out.NewEdgeToken != nil {
+		t.Errorf("token not in rotation window; new_edge_token should be null, got %v", *out.NewEdgeToken)
+	}
+	if out.NextPollAfterSeconds != 15 {
+		t.Errorf("next_poll_after_seconds should default to 15, got %d", out.NextPollAfterSeconds)
+	}
+
+	// Checkpoint persisted.
+	var cnt int
+	db.DB.QueryRow(
+		`SELECT COUNT(*) FROM audit_checkpoints WHERE counterparty_type = 'edge' AND counterparty_id = 'edge-poll-1' AND chain_seq = 7`,
+	).Scan(&cnt)
+	if cnt != 1 {
+		t.Errorf("expected 1 checkpoint row for edge-poll-1 seq=7, got %d", cnt)
+	}
+}
+
+func TestEdgePoll_TriggersTokenRotation(t *testing.T) {
+	app := edgeFederationEnv(t)
+	// Expiry 3 days out — inside the 7-day rotation window.
+	plain := seedEdgeForPoll(t, "edge-poll-rot", "tenant-1", 3*24*time.Hour)
+
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	var out struct {
+		NewEdgeToken      string `json:"new_edge_token"`
+		NewTokenExpiresAt int64  `json:"new_token_expires_at"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.NewEdgeToken == "" {
+		t.Fatal("expected new_edge_token on rotation")
+	}
+	if out.NewEdgeToken[:4] != "vet_" {
+		t.Errorf("rotated token wrong prefix: %q", out.NewEdgeToken)
+	}
+	// New plaintext != old plaintext.
+	if out.NewEdgeToken == plain {
+		t.Error("rotated token must differ from prior plaintext")
+	}
+
+	// DB row updated to the new hash.
+	var storedHash string
+	db.DB.QueryRow(`SELECT token_hash FROM edges WHERE id = 'edge-poll-rot'`).Scan(&storedHash)
+	if storedHash != auth.HashToken(out.NewEdgeToken) {
+		t.Error("stored token_hash doesn't match rotated plaintext")
+	}
+}
+
+func TestEdgePoll_BelowMinimumVersion(t *testing.T) {
+	t.Setenv("MINIMUM_REQUIRED_EDGE_VERSION", "1.0.0")
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-poll-old", "tenant-1", 25*24*time.Hour)
+
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.9.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		t.Errorf("expected 426, got %d", resp.StatusCode)
+	}
+}
+
+func TestEdgePoll_RequiresAuth(t *testing.T) {
+	app := edgeFederationEnv(t)
+	resp := postEdgePoll(t, app, "", map[string]interface{}{
+		"edge_version": "0.1.0",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 without auth, got %d", resp.StatusCode)
+	}
+}

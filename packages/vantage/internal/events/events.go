@@ -76,6 +76,12 @@ func AuditLogSync(userID, action, resourceType, resourceID, details, ip string) 
 	}
 }
 
+// LatestChainHead is the exported variant of loadChainHead used by
+// poll handlers that need to return Vantage's current chain head
+// to the counterparty for their cross-attestation. Same return
+// shape: (chain_seq, signature) or (0, "") on empty chain.
+func LatestChainHead() (int64, string, error) { return loadChainHead() }
+
 // loadChainHead returns the highest (chain_seq, signature) pair
 // currently in the table, or (0, "") if the table is empty (the
 // genesis-row case). The HMAC over prev_signature="" + canonical(row=1)
