@@ -1,19 +1,88 @@
-# Build artifacts
+# ── Dependencies ──────────────────────────────────────────────
+node_modules/
+**/node_modules/
+.pnpm-store/
+
+# ── Next.js ───────────────────────────────────────────────────
+.next/
+out/
+
+# ── Go binaries / build artifacts ─────────────────────────────
 bin/
-dist/
+packages/vantage/vantage
+packages/vantage/*.exe
+packages/vantage/*~
+
+# Go test/profile artifacts
+*.prof
+coverage/
 *.test
 *.out
 
-# Go
+# Go vendor
 vendor/
 
-# Node
-node_modules/
-.next/
-.turbo/
+# ── Secrets / state ──────────────────────────────────────────
+# Real secrets must NEVER be committed. Only *.example files are tracked.
+secrets/
+!secrets/*.example
+secrets/*
+!secrets/.gitkeep
 
-# Local
+# Environment variables
 .env
 .env.local
+.env.production
+.env.*.local
+
+# Databases / data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+backups/
+
+# ── Logs ─────────────────────────────────────────────────────
+logs/
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Playwright / test ────────────────────────────────────────
+playwright-report/
+test-results/
+
+# ── OS files ─────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+
+# ── IDE / personal scratch ───────────────────────────────────
+.vscode/
+.idea/
+.claude/
+.opencode/
+.cursor/
+.aider*
+CLAUDE.md
+PRODUCT.md
+DESIGN.md
+# threatmodel.md is operator-local. Same convention as Edge — never
+# ship the live threat model to a public repo.
+threatmodel.md
+*.swp
+*.swo
+
+# Turbo cache
+.turbo/
+
+# Cache
+.cache/
+temp/
+
+# Generated files
+generated/
+*.tsbuildinfo
