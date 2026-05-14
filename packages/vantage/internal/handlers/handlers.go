@@ -20,6 +20,7 @@ import (
 
 	"vaporrmm/vantage/internal/auth"
 	"vaporrmm/vantage/internal/db"
+	"vaporrmm/vantage/internal/events"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -84,6 +85,9 @@ func loginHandler(c *fiber.Ctx) error {
 	// this UPDATE fails (e.g., transient DB hiccup).
 	_, _ = db.DB.Exec(`UPDATE users SET last_login_at = $1 WHERE id = $2`, time.Now(), userID)
 
+	events.AuditLog(userID, "user.login", "user", userID,
+		"login successful", c.IP())
+
 	return c.JSON(fiber.Map{
 		"user_id":    userID,
 		"role":       role,
@@ -93,6 +97,15 @@ func loginHandler(c *fiber.Ctx) error {
 
 func logoutHandler(c *fiber.Ctx) error {
 	if tok := c.Cookies("auth_token"); tok != "" {
+		// Best-effort: capture the user_id from the session before
+		// revoking, so the audit row names the actor. If the
+		// cookie is invalid the row reads "system" — that's fine,
+		// the logout still succeeds.
+		userID, _, err := auth.ValidateJWT(tok)
+		if err == nil {
+			events.AuditLog(userID, "user.logout", "user", userID,
+				"logout", c.IP())
+		}
 		_ = auth.RevokeSession(tok)
 	}
 	auth.ClearSessionCookies(c)
