@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -437,5 +438,116 @@ func TestEdgePoll_RequiresAuth(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected 401 without auth, got %d", resp.StatusCode)
+	}
+}
+
+func postEdgeEventsHTTP(t *testing.T, app *fiber.App, token string, body interface{}) *http.Response {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/api/edge/events", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	return resp
+}
+
+func TestEdgeEvents_HappyPathBatch(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-evt-1", "tenant-1", 25*24*time.Hour)
+
+	resp := postEdgeEventsHTTP(t, app, plain, map[string]interface{}{
+		"events": []map[string]interface{}{
+			{"correlation_id": "c1", "type": "heartbeat", "occurred_at": time.Now().Unix(), "payload": map[string]string{}},
+			{"correlation_id": "c2", "type": "alert", "occurred_at": time.Now().Unix(), "payload": map[string]string{"severity": "warn"}},
+		},
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(10),
+			"signature": "edgesig-10",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d body=%s", resp.StatusCode, body)
+	}
+	var out struct {
+		Accepted int `json:"accepted"`
+		Rejected []struct {
+			CorrelationID string `json:"correlation_id"`
+			Reason        string `json:"reason"`
+		} `json:"rejected"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Accepted != 2 || len(out.Rejected) != 0 {
+		t.Errorf("expected accepted=2, rejected=0; got %+v", out)
+	}
+
+	// Checkpoint persisted with recorded_during=events.
+	var during string
+	db.DB.QueryRow(
+		`SELECT recorded_during FROM audit_checkpoints WHERE counterparty_id = 'edge-evt-1' AND chain_seq = 10`,
+	).Scan(&during)
+	if during != "events" {
+		t.Errorf("recorded_during should be 'events', got %q", during)
+	}
+}
+
+func TestEdgeEvents_UnknownTypeRejected(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-evt-bad", "tenant-1", 25*24*time.Hour)
+
+	resp := postEdgeEventsHTTP(t, app, plain, map[string]interface{}{
+		"events": []map[string]interface{}{
+			{"correlation_id": "c-bad", "type": "telemetry-burst", "occurred_at": time.Now().Unix()},
+		},
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	var out struct {
+		Accepted int `json:"accepted"`
+		Rejected []struct {
+			CorrelationID string `json:"correlation_id"`
+			Reason        string `json:"reason"`
+		} `json:"rejected"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Accepted != 0 {
+		t.Errorf("unknown event type should not be accepted; got %d", out.Accepted)
+	}
+	if len(out.Rejected) != 1 || out.Rejected[0].CorrelationID != "c-bad" {
+		t.Errorf("expected one rejection for c-bad, got %+v", out.Rejected)
+	}
+}
+
+func TestEdgeEvents_BatchSizeCap(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-evt-big", "tenant-1", 25*24*time.Hour)
+
+	big := make([]map[string]interface{}, 101)
+	for i := range big {
+		big[i] = map[string]interface{}{
+			"correlation_id": fmt.Sprintf("c%d", i),
+			"type":           "heartbeat",
+			"occurred_at":    time.Now().Unix(),
+		}
+	}
+	resp := postEdgeEventsHTTP(t, app, plain, map[string]interface{}{
+		"events": big,
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("oversize batch should be 400, got %d", resp.StatusCode)
 	}
 }

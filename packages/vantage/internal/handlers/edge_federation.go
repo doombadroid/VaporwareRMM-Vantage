@@ -80,6 +80,90 @@ func RegisterEdgeRoutes(app *fiber.App) {
 	// tailnet_identity to c.Locals.
 	authed := app.Group("/api/edge", auth.EdgeAuthMiddleware())
 	authed.Post("/poll", pollEdge)
+	authed.Post("/events", postEdgeEvents)
+}
+
+// maxEventsPerBatch caps a single /api/edge/events request. F4's
+// command-result pipeline batches a handful of results per poll
+// cycle; 100 is generous headroom without enabling DoS.
+const maxEventsPerBatch = 100
+
+// knownEventTypes is the F2 allowlist. F4 will extend.
+var knownEventTypes = map[string]bool{
+	"heartbeat":         true,
+	"alert":             true,
+	"command_result":    true,
+	"inventory_summary": true,
+}
+
+// postEdgeEvents accepts a batch of out-of-band events from Edge.
+// Per issue #22 Q1, events push independently of polling so an
+// alert can surface faster than the 15s poll cadence allows.
+//
+// F2 establishes the contract: validation, per-event accept/reject,
+// audit checkpoint exchange. The downstream application of events
+// (storing alert summaries, command-result correlation) lands with
+// the F4 command pipeline.
+func postEdgeEvents(c *fiber.Ctx) error {
+	var req struct {
+		Events []struct {
+			CorrelationID string          `json:"correlation_id"`
+			Type          string          `json:"type"`
+			OccurredAt    int64           `json:"occurred_at"`
+			Payload       json.RawMessage `json:"payload"`
+		} `json:"events"`
+		AuditChainHead struct {
+			Seq       int64  `json:"seq"`
+			Signature string `json:"signature"`
+		} `json:"audit_chain_head"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+	}
+	if len(req.Events) > maxEventsPerBatch {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("batch size %d exceeds max %d", len(req.Events), maxEventsPerBatch),
+		})
+	}
+
+	edgeID, _ := c.Locals("edge_id").(string)
+
+	events.RecordAuditCheckpointSync("edge", edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, "events")
+
+	type rejection struct {
+		CorrelationID string `json:"correlation_id"`
+		Reason        string `json:"reason"`
+	}
+	rejected := []rejection{}
+	accepted := 0
+	for _, e := range req.Events {
+		if !knownEventTypes[e.Type] {
+			rejected = append(rejected, rejection{
+				CorrelationID: e.CorrelationID,
+				Reason:        "unknown event type: " + e.Type,
+			})
+			continue
+		}
+		// F2 stub-handling: heartbeats are already implicitly
+		// observed via last_seen_at in EdgeAuthMiddleware. The
+		// other three types are logged for now and stored by F4
+		// when the aggregates table lands.
+		slog.Info("edge event",
+			"edge_id", edgeID,
+			"type", e.Type,
+			"correlation_id", e.CorrelationID,
+			"occurred_at", e.OccurredAt,
+		)
+		accepted++
+	}
+
+	events.AuditLog("", "edge.events.batch", "edge", edgeID,
+		fmt.Sprintf("accepted=%d rejected=%d", accepted, len(rejected)), c.IP())
+
+	return c.JSON(fiber.Map{
+		"accepted": accepted,
+		"rejected": rejected,
+	})
 }
 
 // pollEdge handles /api/edge/poll. Issue #22 Q1 + Q5 + Q6 + Q9:
