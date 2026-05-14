@@ -21,10 +21,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -332,6 +334,102 @@ func ClearSessionCookies(c *fiber.Ctx) {
 // IsSuperAdmin: convenience predicate. Federation will introduce
 // finer roles in F2-F8; F1 keeps the two-role model from Edge.
 func IsSuperAdmin(role string) bool { return role == "super_admin" }
+
+// EdgeAuthMiddleware validates federation Bearer tokens for the
+// /api/edge/poll and /api/edge/events endpoints. Issue #22 Q2 +
+// Q10 specify:
+//
+//   - Bearer token + tailnet identity defense in depth: every
+//     request validates the token hash hits the edges table AND
+//     that the source IP matches the tailnet_ip recorded at
+//     registration.
+//
+//   - No in-memory cache. Every request hits Postgres. Q10 forbids
+//     process-local state for cross-request mutable data. If
+//     polling throughput becomes a problem later (~700 lookups/sec
+//     at 10K Edges × 15s polls), the optimization is a Redis cache
+//     with PUB/SUB invalidation; not in F2.
+//
+// Context locals set on success: edge_id, tenant_id,
+// tailnet_identity. Downstream handlers read these instead of
+// re-querying the edges table.
+func EdgeAuthMiddleware() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		authHeader := c.Get("Authorization")
+		if !strings.HasPrefix(authHeader, "Bearer ") {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "missing or malformed Authorization header",
+				"code":  401,
+			})
+		}
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if token == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "empty bearer token", "code": 401})
+		}
+
+		tokenHash := HashToken(token)
+
+		var (
+			edgeID          string
+			tenantID        string
+			tailnetIdentity sql.NullString
+			tailnetIP       sql.NullString
+			tokenExpiresAt  sql.NullInt64
+		)
+		err := db.DB.QueryRow(
+			`SELECT id, tenant_id, tailnet_identity, tailnet_ip, token_expires_at
+			   FROM edges
+			   WHERE token_hash = $1 AND status = 'active'`,
+			tokenHash,
+		).Scan(&edgeID, &tenantID, &tailnetIdentity, &tailnetIP, &tokenExpiresAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unknown or inactive edge token", "code": 401})
+		}
+		if err != nil {
+			slog.Error("edge auth: lookup", "error", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "auth lookup failed"})
+		}
+
+		if tokenExpiresAt.Valid && tokenExpiresAt.Int64 < time.Now().Unix() {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "edge token expired", "code": 401})
+		}
+
+		// Defense in depth: source IP must match the tailnet_ip
+		// recorded at registration. If no IP was recorded, skip
+		// the check (Edges that don't report their tailnet IP — F3
+		// may not have the column populated until first poll — fall
+		// through to plain bearer-token auth).
+		if tailnetIP.Valid && tailnetIP.String != "" {
+			requestIP := c.IP()
+			if requestIP != tailnetIP.String {
+				slog.Warn("edge auth: source IP mismatch",
+					"edge_id", edgeID,
+					"expected_ip", tailnetIP.String,
+					"actual_ip", requestIP,
+				)
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+					"error": "source IP does not match recorded tailnet identity",
+					"code":  401,
+				})
+			}
+		}
+
+		// Heartbeat. Update last_seen_at on every successful auth.
+		// The poll handler doesn't repeat this — middleware-level
+		// gives every authenticated request the same freshness.
+		if _, err := db.DB.Exec(
+			`UPDATE edges SET last_seen_at = $1 WHERE id = $2`,
+			time.Now().Unix(), edgeID,
+		); err != nil {
+			slog.Warn("edge auth: last_seen_at update failed", "error", err, "edge_id", edgeID)
+		}
+
+		c.Locals("edge_id", edgeID)
+		c.Locals("tenant_id", tenantID)
+		c.Locals("tailnet_identity", tailnetIdentity.String)
+		return c.Next()
+	}
+}
 
 // BootstrapAdmin runs at startup. Creates the first admin user if
 // none exist, picking up the password from ADMIN_PASSWORD or
