@@ -12,12 +12,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # pnpm/action-setup MUST run before setup-node, otherwise the
+      # `cache: pnpm` directive can't locate the binary it needs to
+      # compute the cache key. Pinned major version; pnpm version
+      # itself reads from packageManager in package.json (9.15.0
+      # currently) — specifying both produces ERR_PNPM_BAD_PM_VERSION.
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
-      - uses: pnpm/action-setup@v4
-        with:
-          version: "9.15.0"
+          cache: "pnpm"
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
 
@@ -36,32 +40,38 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+    env:
+      DEV_ALLOW_UNENCRYPTED_SECRETS: "1"
+      VANTAGE_TEST_PG_URL: postgres://postgres:ci-test@localhost:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: "1.25"
-      # -p 1 serializes packages so the three test files that touch
-      # the same Postgres schema (db, events, main) don't race each
-      # other's DROP TABLE / migrate / INSERT sequences. F2+ can move
-      # each test pkg onto its own schema if/when this becomes slow.
-      - run: go test -p 1 ./packages/...
-        working-directory: .
-        env:
-          DEV_ALLOW_UNENCRYPTED_SECRETS: "1"
-          VANTAGE_TEST_PG_URL: postgres://postgres:ci-test@localhost:5432/postgres?sslmode=disable
+      # `go test ./packages/...` from the workspace root fails with
+      # "directory prefix packages does not contain modules listed
+      # in go.work" because the workspace root isn't itself a module.
+      # cd into each workspace member and run the per-module test
+      # invocation. -p 1 serializes packages within a module so the
+      # three test files that share a Postgres schema (db, events,
+      # main) don't race each other.
+      - name: Run vantage tests
+        working-directory: packages/vantage
+        run: go test -p 1 ./...
+      - name: Run models tests
+        working-directory: packages/models
+        run: go test ./...
 
   test-dashboard:
     name: Dashboard typecheck + build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
-      - uses: pnpm/action-setup@v4
-        with:
-          version: "9.15.0"
+          cache: "pnpm"
       - run: pnpm install --frozen-lockfile
       - run: pnpm build:dashboard
 
