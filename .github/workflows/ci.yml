@@ -41,7 +41,11 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.25"
-      - run: go test ./packages/...
+      # -p 1 serializes packages so the three test files that touch
+      # the same Postgres schema (db, events, main) don't race each
+      # other's DROP TABLE / migrate / INSERT sequences. F2+ can move
+      # each test pkg onto its own schema if/when this becomes slow.
+      - run: go test -p 1 ./packages/...
         working-directory: .
         env:
           DEV_ALLOW_UNENCRYPTED_SECRETS: "1"
