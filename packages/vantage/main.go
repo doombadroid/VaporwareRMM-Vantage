@@ -8,6 +8,7 @@ import (
 	"vaporrmm/vantage/internal/crypto"
 	"vaporrmm/vantage/internal/db"
 	"vaporrmm/vantage/internal/handlers"
+	"vaporrmm/vantage/internal/signing"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -42,6 +43,10 @@ func main() {
 	}
 	if err := auth.BootstrapAdmin(); err != nil {
 		slog.Error("admin bootstrap failed; refusing to start", "error", err)
+		os.Exit(1)
+	}
+	if err := signing.Bootstrap(); err != nil {
+		slog.Error("signing keypair bootstrap failed; refusing to start", "error", err)
 		os.Exit(1)
 	}
 

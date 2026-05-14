@@ -23,7 +23,7 @@ func TestAuditLogSync_ChainContinuity(t *testing.T) {
 	t.Setenv("DATABASE_URL", url)
 	t.Cleanup(func() {
 		if db.DB != nil {
-			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 			_ = db.DB.Close()
 			db.DB = nil
 		}

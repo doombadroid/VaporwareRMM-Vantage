@@ -28,6 +28,7 @@ type fakeTSClient struct {
 	validateAuthKey   func(ctx context.Context, tn string) error
 	validateDeviceLst func(ctx context.Context, tn string) error
 	listDevices       func(ctx context.Context, tn string) ([]tailscale.Device, error)
+	mintEnrollment    func(ctx context.Context, tn, desc string) (*tailscale.AuthKey, error)
 }
 
 func (f *fakeTSClient) Authenticate(ctx context.Context) error {
@@ -60,6 +61,12 @@ func (f *fakeTSClient) ListDevices(ctx context.Context, tn string) ([]tailscale.
 	}
 	return f.listDevices(ctx, tn)
 }
+func (f *fakeTSClient) MintEdgeEnrollmentAuthKey(ctx context.Context, tn, desc string) (*tailscale.AuthKey, error) {
+	if f.mintEnrollment == nil {
+		return &tailscale.AuthKey{ID: "fake-key-id", Key: "tskey-auth-fake"}, nil
+	}
+	return f.mintEnrollment(ctx, tn, desc)
+}
 
 const tailscaleTestEncryptionKey = "fmZn0pFd/f58gKeknlaECEbcMDh5oQ+nRhFB/sAMScY="
 
@@ -82,11 +89,11 @@ func tailscaleTestEnv(t *testing.T, role string) (*fiber.App, func(client tailsc
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	_, _ = conn.Exec(`DROP TABLE IF EXISTS tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+	_, _ = conn.Exec(`DROP TABLE IF EXISTS enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 	_ = conn.Close()
 	t.Cleanup(func() {
 		if db.DB != nil {
-			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 			_ = db.DB.Close()
 			db.DB = nil
 		}

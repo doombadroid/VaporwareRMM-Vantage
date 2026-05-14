@@ -33,6 +33,7 @@ import (
 	"vaporrmm/vantage/internal/crypto"
 	"vaporrmm/vantage/internal/db"
 	"vaporrmm/vantage/internal/handlers"
+	"vaporrmm/vantage/internal/signing"
 
 	"github.com/gofiber/fiber/v2"
 	_ "github.com/lib/pq"
@@ -59,11 +60,11 @@ func resetForTest(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	_, _ = conn.Exec(`DROP TABLE IF EXISTS tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+	_, _ = conn.Exec(`DROP TABLE IF EXISTS enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 	_ = conn.Close()
 	t.Cleanup(func() {
 		if db.DB != nil {
-			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 			_ = db.DB.Close()
 			db.DB = nil
 		}
@@ -81,6 +82,10 @@ func newAppForTest(t *testing.T) *fiber.App {
 	}
 	if err := auth.BootstrapAdmin(); err != nil {
 		t.Fatalf("BootstrapAdmin: %v", err)
+	}
+	signing.ResetForTests()
+	if err := signing.Bootstrap(); err != nil {
+		t.Fatalf("signing.Bootstrap: %v", err)
 	}
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	handlers.RegisterPublicRoutes(app)
