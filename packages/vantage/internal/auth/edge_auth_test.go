@@ -200,3 +200,63 @@ func TestEdgeAuthMiddleware_TokenExactlyAtExpiry(t *testing.T) {
 		t.Errorf("token exactly at expiry should be 401, got %d", resp.StatusCode)
 	}
 }
+
+// Codex finding #4: scheme name is case-insensitive per RFC 7235.
+
+func authedRequestRaw(authHeader string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/echo", nil)
+	if authHeader != "" {
+		r.Header.Set("Authorization", authHeader)
+	}
+	return r
+}
+
+func TestEdgeAuth_BearerLowercase(t *testing.T) {
+	app := edgeAuthEnv(t)
+	plain := seedEdge(t, "edge-lower", "tenant-x", "", "active", time.Hour)
+	resp, _ := app.Test(authedRequestRaw("bearer "+plain), -1)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("lowercase 'bearer' should auth, got %d", resp.StatusCode)
+	}
+}
+
+func TestEdgeAuth_BearerMixedCase(t *testing.T) {
+	app := edgeAuthEnv(t)
+	plain := seedEdge(t, "edge-mixed", "tenant-x", "", "active", time.Hour)
+	resp, _ := app.Test(authedRequestRaw("BeArEr "+plain), -1)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("mixed-case 'BeArEr' should auth, got %d", resp.StatusCode)
+	}
+}
+
+func TestEdgeAuth_BearerUppercase(t *testing.T) {
+	app := edgeAuthEnv(t)
+	plain := seedEdge(t, "edge-upper", "tenant-x", "", "active", time.Hour)
+	resp, _ := app.Test(authedRequestRaw("BEARER "+plain), -1)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("uppercase 'BEARER' should auth, got %d", resp.StatusCode)
+	}
+}
+
+func TestEdgeAuth_NoScheme(t *testing.T) {
+	app := edgeAuthEnv(t)
+	plain := seedEdge(t, "edge-noscheme", "tenant-x", "", "active", time.Hour)
+	resp, _ := app.Test(authedRequestRaw(plain), -1) // raw token, no scheme
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("missing scheme should be 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestEdgeAuth_WrongScheme(t *testing.T) {
+	app := edgeAuthEnv(t)
+	plain := seedEdge(t, "edge-wrongscheme", "tenant-x", "", "active", time.Hour)
+	resp, _ := app.Test(authedRequestRaw("Basic "+plain), -1)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("non-Bearer scheme should be 401, got %d", resp.StatusCode)
+	}
+}

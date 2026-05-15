@@ -409,14 +409,20 @@ func IsSuperAdmin(role string) bool { return role == "super_admin" }
 // scale requires it.
 func EdgeAuthMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		authHeader := c.Get("Authorization")
-		if !strings.HasPrefix(authHeader, "Bearer ") {
+		// RFC 7235 §2.1: auth-scheme names are case-insensitive.
+		// Clients in the wild send "Bearer", "bearer", and
+		// occasionally "BEARER"; codex finding #4 caught that the
+		// strict HasPrefix("Bearer ") check rejected everything
+		// but Title case.
+		const scheme = "bearer "
+		authHeader := strings.TrimSpace(c.Get("Authorization"))
+		if len(authHeader) < len(scheme) || !strings.EqualFold(authHeader[:len(scheme)], scheme) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "missing or malformed Authorization header",
 				"code":  401,
 			})
 		}
-		token := strings.TrimPrefix(authHeader, "Bearer ")
+		token := strings.TrimSpace(authHeader[len(scheme):])
 		if token == "" {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "empty bearer token", "code": 401})
 		}
