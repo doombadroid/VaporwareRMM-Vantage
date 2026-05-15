@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"vaporrmm/vantage/internal/auth"
@@ -46,6 +47,14 @@ const defaultPollIntervalSeconds = 15
 // in the response. 7 days gives Edges plenty of margin to pick up
 // the new token before the old one expires.
 const tokenRotationWindow = 7 * 24 * time.Hour
+
+// ErrTokenHashMismatch fires from maybeRotateToken when the
+// presented token hash no longer matches the edges row inside the
+// rotation transaction. A concurrent poll rotated the token after
+// the middleware validated it but before this request reached the
+// rotation step. The caller must reject with 401 so the Edge
+// re-presents whatever token won that race.
+var ErrTokenHashMismatch = errors.New("edge token hash mismatch")
 
 // RegisterEdgeRoutes mounts the federation endpoints on the app.
 // register is at the root group with its own rate limiter; the
@@ -262,10 +271,20 @@ func pollEdge(c *fiber.Ctx) error {
 	// the response leaves.
 	events.RecordAuditCheckpointSync("edge", edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, "poll")
 
-	// Token rotation. Inside a transaction with FOR UPDATE so
-	// concurrent polls from the same Edge (rare; clock skew) can't
-	// double-rotate.
-	rotatedToken, newExpiresAt, err := maybeRotateToken(edgeID)
+	// Token rotation. Re-hash the bearer the request arrived with;
+	// maybeRotateToken's tx revalidates that hash against the row
+	// (defense against concurrent-poll races where the middleware
+	// validated against a token that's since been rotated by a
+	// peer request — codex round-3 finding #1).
+	presentedToken := extractBearerToken(c)
+	presentedHash := auth.HashToken(presentedToken)
+	rotatedToken, newExpiresAt, err := maybeRotateToken(edgeID, presentedHash)
+	if errors.Is(err, ErrTokenHashMismatch) {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "token has been rotated concurrently; re-authenticate with the latest token",
+			"code":  "token_concurrently_rotated",
+		})
+	}
 	if err != nil {
 		slog.Error("poll: rotate check", "error", err, "edge_id", edgeID)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotation check failed"})
@@ -293,21 +312,37 @@ func pollEdge(c *fiber.Ctx) error {
 }
 
 // maybeRotateToken atomically checks expiry and rotates if needed.
-// Returns the new plaintext token (empty if no rotation) and the
-// new expiry timestamp.
-func maybeRotateToken(edgeID string) (string, int64, error) {
+// presentedTokenHash is the SHA-256 of the bearer token the request
+// arrived with. Inside the transaction we re-read token_hash with
+// a row lock and refuse to rotate if it no longer matches — a
+// concurrent poll has already rotated and this request is holding
+// a stale token. ErrTokenHashMismatch signals that case so the
+// caller can return 401 rather than overwriting the row with a
+// rotation based on an old hash.
+//
+// Returns (newPlaintext, newExpiry, nil) on a successful rotation,
+// ("", 0, nil) when no rotation was needed, or (zero, zero, err)
+// on failure (including ErrTokenHashMismatch).
+func maybeRotateToken(edgeID, presentedTokenHash string) (string, int64, error) {
 	tx, err := db.DB.Begin()
 	if err != nil {
 		return "", 0, fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var currentHash sql.NullString
 	var expiresAt sql.NullInt64
 	if err := tx.QueryRow(
-		`SELECT token_expires_at FROM edges WHERE id = $1 FOR UPDATE`,
+		`SELECT token_hash, token_expires_at FROM edges WHERE id = $1 FOR UPDATE`,
 		edgeID,
-	).Scan(&expiresAt); err != nil {
-		return "", 0, fmt.Errorf("read expiry: %w", err)
+	).Scan(&currentHash, &expiresAt); err != nil {
+		return "", 0, fmt.Errorf("read row: %w", err)
+	}
+	if !currentHash.Valid || currentHash.String != presentedTokenHash {
+		// Codex round-3 finding #1: a concurrent rotation already
+		// happened. Caller must 401 and the Edge needs to switch
+		// to whichever token won that race.
+		return "", 0, ErrTokenHashMismatch
 	}
 	if !expiresAt.Valid {
 		return "", 0, nil
@@ -325,11 +360,15 @@ func maybeRotateToken(edgeID string) (string, int64, error) {
 	}
 	newHash := auth.HashToken(newPlain)
 	newExpires := now.Add(edgeTokenTTL).Unix()
+	// Guard the UPDATE with the presented hash so even if a
+	// second concurrent transaction somehow slipped past the
+	// FOR UPDATE lock (shouldn't, but defense-in-depth), the
+	// WHERE clause refuses to rotate a stale row.
 	if _, err := tx.Exec(
 		`UPDATE edges
 		     SET token_hash = $1, token_issued_at = $2, token_expires_at = $3
-		     WHERE id = $4`,
-		newHash, now.Unix(), newExpires, edgeID,
+		     WHERE id = $4 AND token_hash = $5`,
+		newHash, now.Unix(), newExpires, edgeID, presentedTokenHash,
 	); err != nil {
 		return "", 0, fmt.Errorf("rotate update: %w", err)
 	}
@@ -516,6 +555,21 @@ func registerEdge(c *fiber.Ctx) error {
 		"token_expires_at":      tokenExpiresAt,
 		"poll_interval_seconds": defaultPollIntervalSeconds,
 	})
+}
+
+// extractBearerToken pulls the token out of the Authorization
+// header. Mirrors EdgeAuthMiddleware's case-insensitive parse
+// (RFC 7235 §2.1) so the rotation revalidation hashes the same
+// bytes the middleware did. Returns "" if no usable token —
+// callers shouldn't reach this code path without middleware
+// having already accepted a token, but be defensive.
+func extractBearerToken(c *fiber.Ctx) string {
+	const scheme = "bearer "
+	h := strings.TrimSpace(c.Get("Authorization"))
+	if len(h) < len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(scheme):])
 }
 
 // auditChainHeadInvalid writes a 400 response describing what's

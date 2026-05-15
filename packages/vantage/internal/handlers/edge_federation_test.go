@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -847,5 +848,95 @@ func TestEdgePoll_MalformedClientVersion(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !bytes.Contains(body, []byte("invalid_edge_version")) {
 		t.Errorf("body should carry code=invalid_edge_version, got %s", body)
+	}
+}
+
+// TestEdgePoll_ConcurrentRotationRace: codex round-3 finding #1.
+// N concurrent polls from the same Edge with the same near-expiry
+// token. The first to acquire the rotation row lock wins and
+// returns new_edge_token; the others must see their token hash no
+// longer match inside the transaction and return 401 with code
+// token_concurrently_rotated. The edges.token_hash must match
+// exactly the winner's new token at the end.
+func TestEdgePoll_ConcurrentRotationRace(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-rot-race", "tenant-1", 3*24*time.Hour)
+
+	const N = 10
+	type result struct {
+		status   int
+		newToken string
+		code     string
+	}
+	results := make([]result, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp := postEdgePoll(t, app, plain, map[string]interface{}{
+				"edge_version": "0.1.0",
+				"audit_chain_head": map[string]interface{}{
+					"seq":       int64(i + 1),
+					"signature": fmt.Sprintf("sig-%d", i),
+				},
+			})
+			defer resp.Body.Close()
+			var out struct {
+				NewEdgeToken string `json:"new_edge_token"`
+				Code         string `json:"code"`
+			}
+			json.NewDecoder(resp.Body).Decode(&out)
+			results[i] = result{status: resp.StatusCode, newToken: out.NewEdgeToken, code: out.Code}
+		}(i)
+	}
+	wg.Wait()
+
+	winners := 0
+	rejected := 0
+	winnerToken := ""
+	for _, r := range results {
+		switch {
+		case r.status == http.StatusOK && r.newToken != "":
+			winners++
+			winnerToken = r.newToken
+		case r.status == http.StatusUnauthorized:
+			// Two valid rejection paths: middleware noticed the
+			// row's hash had changed (auth lookup miss) OR the
+			// in-tx revalidation fired (code=token_concurrently_
+			// rotated). Both correctly refuse a stale token.
+			rejected++
+		}
+	}
+	if winners != 1 {
+		t.Errorf("exactly one rotation winner expected, got %d (results: %+v)", winners, results)
+	}
+	if winners+rejected != N {
+		t.Errorf("expected %d total winners+rejected, got winners=%d rejected=%d (results: %+v)", N, winners, rejected, results)
+	}
+
+	var storedHash string
+	db.DB.QueryRow(`SELECT token_hash FROM edges WHERE id = 'edge-rot-race'`).Scan(&storedHash)
+	if storedHash != auth.HashToken(winnerToken) {
+		t.Error("edges.token_hash must match winner's new token after the race")
+	}
+}
+
+// TestMaybeRotateToken_StaleHashReturnsErr drives the in-tx
+// revalidation path directly. The concurrent test above can't
+// deterministically land on this branch because middleware
+// filters stale presentations first.
+func TestMaybeRotateToken_StaleHashReturnsErr(t *testing.T) {
+	_ = edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-stale", "tenant-1", 3*24*time.Hour)
+	currentHash := auth.HashToken(plain)
+	staleHash := auth.HashToken("vet_other_value_42")
+	if currentHash == staleHash {
+		t.Fatal("test fixture broken: hashes should differ")
+	}
+
+	_, _, err := maybeRotateToken("edge-stale", staleHash)
+	if !errors.Is(err, ErrTokenHashMismatch) {
+		t.Errorf("expected ErrTokenHashMismatch on stale presented hash, got %v", err)
 	}
 }
