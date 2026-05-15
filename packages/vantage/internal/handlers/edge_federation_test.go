@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -549,5 +550,61 @@ func TestEdgeEvents_BatchSizeCap(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("oversize batch should be 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestEdgeRegister_ConcurrentConsumptionRace(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEnrollment(t, "tenant-race", time.Hour)
+
+	const N = 10
+	var wg sync.WaitGroup
+	statuses := make([]int, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp := postEdgeRegister(t, app, map[string]interface{}{
+				"enrollment_token": plain,
+				"edge_version":     "0.1.0",
+				"edge_hostname":    fmt.Sprintf("racer-%d", i),
+			})
+			defer resp.Body.Close()
+			statuses[i] = resp.StatusCode
+		}(i)
+	}
+	wg.Wait()
+
+	successCount, conflictCount := 0, 0
+	for _, s := range statuses {
+		switch s {
+		case http.StatusOK:
+			successCount++
+		case http.StatusConflict:
+			conflictCount++
+		}
+	}
+	if successCount != 1 {
+		t.Errorf("exactly one register should succeed, got %d (statuses: %v)", successCount, statuses)
+	}
+	if conflictCount != N-1 {
+		t.Errorf("expected %d conflicts, got %d", N-1, conflictCount)
+	}
+
+	var rowCount int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM edges`).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 1 {
+		t.Errorf("exactly one edges row should exist, got %d", rowCount)
+	}
+
+	var consumedAt sql.NullInt64
+	db.DB.QueryRow(
+		`SELECT consumed_at FROM enrollment_tokens WHERE token_hash = $1`,
+		auth.HashToken(plain),
+	).Scan(&consumedAt)
+	if !consumedAt.Valid {
+		t.Error("consumed_at should be set exactly once after the race")
 	}
 }

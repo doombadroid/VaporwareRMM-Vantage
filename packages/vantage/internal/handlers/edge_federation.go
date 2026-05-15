@@ -337,45 +337,6 @@ func registerEdge(c *fiber.Ctx) error {
 	}
 
 	tokenHash := auth.HashToken(req.EnrollmentToken)
-
-	// Inside the transaction: look up the enrollment token, validate
-	// not-consumed and not-expired, insert the new edges row, mark
-	// the enrollment_token consumed. If any step fails, both
-	// sides roll back together so the token stays single-use.
-	tx, err := db.DB.Begin()
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "transaction begin failed"})
-	}
-	defer func() {
-		// Rollback is a no-op after a successful Commit. If we
-		// returned early on error, this rolls back state.
-		_ = tx.Rollback()
-	}()
-
-	var (
-		etID         string
-		etTenantID   string
-		etExpiresAt  int64
-		etConsumedAt sql.NullInt64
-	)
-	if err := tx.QueryRow(
-		`SELECT id, tenant_id, expires_at, consumed_at FROM enrollment_tokens WHERE token_hash = $1`,
-		tokenHash,
-	).Scan(&etID, &etTenantID, &etExpiresAt, &etConsumedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unknown enrollment token"})
-		}
-		slog.Error("edge register: enrollment lookup", "error", err)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "enrollment lookup failed"})
-	}
-	if etConsumedAt.Valid {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "enrollment token already consumed"})
-	}
-	now := time.Now()
-	if etExpiresAt < now.Unix() {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "enrollment token expired"})
-	}
-
 	edgeID := uuid.New().String()
 	edgeTokenPlain, err := generateEdgeToken()
 	if err != nil {
@@ -383,7 +344,76 @@ func registerEdge(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to generate edge token"})
 	}
 	edgeTokenHash := auth.HashToken(edgeTokenPlain)
+	now := time.Now()
+	nowUnix := now.Unix()
 	tokenExpiresAt := now.Add(edgeTokenTTL).Unix()
+
+	// Single-use enforcement at the DB layer (codex finding #6).
+	// Two concurrent requests with the same token would both pass a
+	// SELECT-then-UPDATE check under Read Committed; the atomic
+	// UPDATE...WHERE consumed_at IS NULL...RETURNING guarantees
+	// exactly one wins. The losing request sees 0 rows affected
+	// and we diagnose via a follow-up SELECT to return precise
+	// 401/409 codes.
+	//
+	// The UPDATE runs BEFORE the edges INSERT inside the same
+	// transaction. If the INSERT fails (constraint violation, FK
+	// violation, etc.), the transaction rolls back and the row
+	// returns to consumed_at IS NULL — the enrollment stays
+	// replayable, which is the invariant we want for failed
+	// registrations.
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "transaction begin failed"})
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Two-step consume: first atomic UPDATE claims the row by
+	// setting consumed_at (without consumed_by_edge_id, since the
+	// edges row doesn't exist yet and the FK would fail). After
+	// the INSERT lands, a second UPDATE wires up the FK. All three
+	// statements run in one transaction so a failed INSERT rolls
+	// back the consume.
+	var etID, etTenantID string
+	consumeErr := tx.QueryRow(
+		`UPDATE enrollment_tokens
+		     SET consumed_at = $1
+		     WHERE token_hash = $2 AND consumed_at IS NULL AND expires_at > $1
+		     RETURNING id, tenant_id`,
+		nowUnix, tokenHash,
+	).Scan(&etID, &etTenantID)
+	if errors.Is(consumeErr, sql.ErrNoRows) {
+		// Diagnose: does the row exist? Is it consumed or expired?
+		// Same tx so we observe the post-UPDATE state of the row
+		// the winning request left behind (consumed_at set).
+		var consumedAt sql.NullInt64
+		var expiresAt int64
+		diagErr := tx.QueryRow(
+			`SELECT consumed_at, expires_at FROM enrollment_tokens WHERE token_hash = $1`,
+			tokenHash,
+		).Scan(&consumedAt, &expiresAt)
+		if errors.Is(diagErr, sql.ErrNoRows) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unknown enrollment token"})
+		}
+		if diagErr != nil {
+			slog.Error("edge register: diagnose consume failure", "error", diagErr)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "consume diagnostics failed"})
+		}
+		if consumedAt.Valid {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "enrollment token already consumed"})
+		}
+		if expiresAt < nowUnix {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "enrollment token expired"})
+		}
+		// Row exists, not consumed, not expired — yet the UPDATE
+		// matched 0 rows. Unreachable in practice; return 500.
+		slog.Error("edge register: consume returned 0 rows but row appears valid", "token_hash", tokenHash)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "consume failed unexpectedly"})
+	}
+	if consumeErr != nil {
+		slog.Error("edge register: consume update", "error", consumeErr)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "consume failed"})
+	}
 
 	if _, err := tx.Exec(
 		`INSERT INTO edges
@@ -398,11 +428,11 @@ func registerEdge(c *fiber.Ctx) error {
 		nullableString(req.TailnetIdentity),
 		nullableString(req.TailnetIP),
 		edgeTokenHash,
-		now.Unix(),
+		nowUnix,
 		tokenExpiresAt,
 		req.EdgeVersion,
-		now.Unix(),
-		now.Unix(),
+		nowUnix,
+		nowUnix,
 		etID,
 	); err != nil {
 		slog.Error("edge register: insert edge", "error", err)
@@ -410,13 +440,11 @@ func registerEdge(c *fiber.Ctx) error {
 	}
 
 	if _, err := tx.Exec(
-		`UPDATE enrollment_tokens
-		     SET consumed_at = $1, consumed_by_edge_id = $2
-		     WHERE id = $3`,
-		now.Unix(), edgeID, etID,
+		`UPDATE enrollment_tokens SET consumed_by_edge_id = $1 WHERE id = $2`,
+		edgeID, etID,
 	); err != nil {
-		slog.Error("edge register: mark consumed", "error", err)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to mark enrollment consumed"})
+		slog.Error("edge register: link consumed_by_edge_id", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to link consume"})
 	}
 
 	if err := tx.Commit(); err != nil {
