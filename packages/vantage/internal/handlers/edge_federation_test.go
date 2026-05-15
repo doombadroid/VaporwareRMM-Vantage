@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -922,25 +921,6 @@ func TestEdgePoll_ConcurrentRotationRace(t *testing.T) {
 	}
 }
 
-// TestMaybeRotateToken_StaleHashReturnsErr drives the in-tx
-// revalidation path directly. The concurrent test above can't
-// deterministically land on this branch because middleware
-// filters stale presentations first.
-func TestMaybeRotateToken_StaleHashReturnsErr(t *testing.T) {
-	_ = edgeFederationEnv(t)
-	plain := seedEdgeForPoll(t, "edge-stale", "tenant-1", 3*24*time.Hour)
-	currentHash := auth.HashToken(plain)
-	staleHash := auth.HashToken("vet_other_value_42")
-	if currentHash == staleHash {
-		t.Fatal("test fixture broken: hashes should differ")
-	}
-
-	_, _, err := maybeRotateToken("edge-stale", staleHash)
-	if !errors.Is(err, ErrTokenHashMismatch) {
-		t.Errorf("expected ErrTokenHashMismatch on stale presented hash, got %v", err)
-	}
-}
-
 // TestEdgePoll_ChainReadFailure: codex round-3 finding #2. When
 // the audit_log table is unavailable (simulated by dropping it),
 // LatestChainHead errors and the poll handler must return 500
@@ -1141,5 +1121,175 @@ func TestEdgePoll_StaleTokenDoesNotMutateState(t *testing.T) {
 	}
 	if checkpoints != 0 {
 		t.Errorf("audit_checkpoint written on 401 path: %d rows", checkpoints)
+	}
+}
+
+// Codex round-5 atomicity tests. pollEdge must commit rotation
+// only when every other mutation (edge_version UPDATE, audit
+// checkpoint INSERT) and every preceding read (LatestChainHead)
+// succeeds. A failure in any of those must roll back the rotation
+// so the old token remains valid for retry.
+
+// TestEdgePoll_ChainHeadReadFailure_NoRotation: drop audit_log to
+// force LatestChainHead to error. Phase 2 fails before the
+// transaction opens; no rotation occurs and the old token must
+// still authenticate on the next poll.
+func TestEdgePoll_ChainHeadReadFailure_NoRotation(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-r5-chainfail", "tenant-1", 3*24*time.Hour)
+	preHash := auth.HashToken(plain)
+
+	if _, err := db.DB.Exec(`DROP TABLE audit_log CASCADE`); err != nil {
+		t.Fatalf("drop audit_log: %v", err)
+	}
+
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("chain read failure should be 500, got %d", resp.StatusCode)
+	}
+
+	// Token hash unchanged — no rotation took place.
+	var afterHash string
+	db.DB.QueryRow(`SELECT token_hash FROM edges WHERE id = 'edge-r5-chainfail'`).Scan(&afterHash)
+	if afterHash != preHash {
+		t.Errorf("token rotated despite chain-read failure: pre=%q post=%q", preHash, afterHash)
+	}
+
+	// No audit_checkpoints row written for this counterparty.
+	var checkpoints int
+	db.DB.QueryRow(
+		`SELECT COUNT(*) FROM audit_checkpoints WHERE counterparty_id = 'edge-r5-chainfail'`,
+	).Scan(&checkpoints)
+	if checkpoints != 0 {
+		t.Errorf("audit checkpoint persisted despite chain-read failure: %d rows", checkpoints)
+	}
+}
+
+// TestEdgePoll_AuditCheckpointWriteFailure_NoRotation: drop
+// audit_checkpoints so the INSERT inside phase 3 errors. Rotation
+// must roll back; token still valid afterward.
+func TestEdgePoll_AuditCheckpointWriteFailure_NoRotation(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-r5-chkfail", "tenant-1", 3*24*time.Hour)
+	preHash := auth.HashToken(plain)
+	// Lock a baseline edge_version so we can detect mutation.
+	if _, err := db.DB.Exec(`UPDATE edges SET edge_version = '0.1.0-baseline' WHERE id = 'edge-r5-chkfail'`); err != nil {
+		t.Fatalf("set baseline version: %v", err)
+	}
+
+	if _, err := db.DB.Exec(`DROP TABLE audit_checkpoints CASCADE`); err != nil {
+		t.Fatalf("drop audit_checkpoints: %v", err)
+	}
+
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.9.9-should-rollback",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("checkpoint failure should be 500, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("checkpoint_write_failed")) {
+		t.Errorf("body should carry code=checkpoint_write_failed, got %s", body)
+	}
+
+	// Token unchanged — rotation rolled back with the failed checkpoint.
+	var afterHash, afterVersion string
+	db.DB.QueryRow(
+		`SELECT token_hash, COALESCE(edge_version, '') FROM edges WHERE id = 'edge-r5-chkfail'`,
+	).Scan(&afterHash, &afterVersion)
+	if afterHash != preHash {
+		t.Errorf("token rotated despite checkpoint failure: pre=%q post=%q", preHash, afterHash)
+	}
+	if afterVersion != "0.1.0-baseline" {
+		t.Errorf("edge_version mutated despite tx rollback: got %q", afterVersion)
+	}
+}
+
+// TestEdgePoll_FullSuccess_RotatesAtomic: happy path — every
+// mutation must land together. Subsequent poll with old token →
+// 401; subsequent poll with new token → 200.
+func TestEdgePoll_FullSuccess_RotatesAtomic(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-r5-ok", "tenant-1", 3*24*time.Hour)
+	preHash := auth.HashToken(plain)
+
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.2.0-reported",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(42),
+			"signature": "edgesig-42",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("happy path expected 200, got %d body=%s", resp.StatusCode, body)
+	}
+	var out struct {
+		NewEdgeToken string `json:"new_edge_token"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.NewEdgeToken == "" {
+		t.Fatal("expected rotation; no new_edge_token in response")
+	}
+
+	// All three mutations landed together.
+	var afterHash, afterVersion string
+	db.DB.QueryRow(
+		`SELECT token_hash, edge_version FROM edges WHERE id = 'edge-r5-ok'`,
+	).Scan(&afterHash, &afterVersion)
+	if afterHash == preHash {
+		t.Error("token_hash didn't change after successful rotation")
+	}
+	if afterHash != auth.HashToken(out.NewEdgeToken) {
+		t.Error("stored hash doesn't match returned plaintext")
+	}
+	if afterVersion != "0.2.0-reported" {
+		t.Errorf("edge_version not updated: got %q", afterVersion)
+	}
+	var checkpoints int
+	db.DB.QueryRow(
+		`SELECT COUNT(*) FROM audit_checkpoints WHERE counterparty_id = 'edge-r5-ok' AND chain_seq = 42`,
+	).Scan(&checkpoints)
+	if checkpoints != 1 {
+		t.Errorf("expected exactly one checkpoint row for seq=42, got %d", checkpoints)
+	}
+
+	// Old token now 401.
+	resp2 := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.2.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(43),
+			"signature": "sig",
+		},
+	})
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Errorf("old token after rotation should be 401, got %d", resp2.StatusCode)
+	}
+
+	// New token succeeds.
+	resp3 := postEdgePoll(t, app, out.NewEdgeToken, map[string]interface{}{
+		"edge_version": "0.2.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(43),
+			"signature": "sig",
+		},
+	})
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Errorf("new token should succeed, got %d", resp3.StatusCode)
 	}
 }

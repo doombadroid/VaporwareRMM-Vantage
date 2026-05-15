@@ -48,13 +48,16 @@ const defaultPollIntervalSeconds = 15
 // the new token before the old one expires.
 const tokenRotationWindow = 7 * 24 * time.Hour
 
-// ErrTokenHashMismatch fires from maybeRotateToken when the
-// presented token hash no longer matches the edges row inside the
-// rotation transaction. A concurrent poll rotated the token after
-// the middleware validated it but before this request reached the
-// rotation step. The caller must reject with 401 so the Edge
-// re-presents whatever token won that race.
-var ErrTokenHashMismatch = errors.New("edge token hash mismatch")
+// Rotation-race rejection (round 3 → round 5):
+//
+// Earlier iterations of pollEdge factored rotation into a
+// standalone maybeRotateToken helper that returned the sentinel
+// ErrTokenHashMismatch when the presented hash no longer matched
+// the row. Round 5 inlined the rotation inside a single handler
+// transaction so all mutations (rotation, edge_version, audit
+// checkpoint) commit atomically. The sentinel disappeared with
+// the helper; the in-tx mismatch check now returns 401
+// token_concurrently_rotated directly.
 
 // RegisterEdgeRoutes mounts the federation endpoints on the app.
 // register is at the root group with its own rate limiter; the
@@ -227,10 +230,33 @@ func postEdgeEvents(c *fiber.Ctx) error {
 //   operator-issued bundle. No grace window — the simpler
 //   contract closes a race where an attacker who captured the
 //   old token could use it during a rotation overlap.
+// pollEdge is structured around four strict phases (codex round-5
+// #1/#2):
+//
+//   Phase 1: parse + validate the request body. No state mutation.
+//   Phase 2: read failure-prone external state (Vantage chain
+//            head). No state mutation; failures here return 500
+//            with old state intact.
+//   Phase 3: single transaction wraps every mutation — rotation
+//            check, rotation UPDATE (if window), edge_version
+//            UPDATE, audit_checkpoints INSERT. COMMIT is the last
+//            act. If anything before commit fails, rollback
+//            restores the pre-handler state and Edge can retry
+//            with the same token.
+//   Phase 4: build + return response. Past commit, no failure
+//            path can lose the rotation.
+//
+// Failure surface that remains: TCP reset between commit and
+// client-side receive. Edge will see no response, retry with old
+// token, get 401 from middleware (token rotated), need to
+// re-enroll. Two-phase rotation (old + new valid until Edge ACKs
+// the new) would close this, but it adds significant complexity
+// and is out of scope for F2.
 func pollEdge(c *fiber.Ctx) error {
+	// ---- Phase 1: parse + validate ----
 	var req struct {
-		EdgeVersion     string `json:"edge_version"`
-		AuditChainHead  struct {
+		EdgeVersion    string `json:"edge_version"`
+		AuditChainHead struct {
 			Seq       int64  `json:"seq"`
 			Signature string `json:"signature"`
 		} `json:"audit_chain_head"`
@@ -246,10 +272,8 @@ func pollEdge(c *fiber.Ctx) error {
 	minimum := os.Getenv("MINIMUM_REQUIRED_EDGE_VERSION")
 	ok, err := versionAtLeast(req.EdgeVersion, minimum)
 	if err != nil {
-		// Server-side MINIMUM_REQUIRED_EDGE_VERSION is validated
-		// at boot (ValidateMinEdgeVersion in version.go), so any
-		// versionAtLeast error here is unambiguously the client
-		// sending a malformed edge_version.
+		// MINIMUM_REQUIRED_EDGE_VERSION validated at boot, so any
+		// versionAtLeast error here is the client's edge_version.
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "malformed edge_version: " + err.Error(),
 			"code":  "invalid_edge_version",
@@ -263,56 +287,15 @@ func pollEdge(c *fiber.Ctx) error {
 			"current_version":      req.EdgeVersion,
 		})
 	}
-
-	// Rotation race gate first (codex round-4 #1/#2). Every
-	// state-mutating side effect — edge_version UPDATE, audit
-	// checkpoint write — must happen AFTER the rotation race
-	// check succeeds. A stale-token poll that loses the race
-	// returns 401 without leaving operator-visible state behind.
-	//
-	// Middleware's last_seen_at UPDATE stays where it is. That
-	// reflects "this token presented itself" which is still true
-	// for a race-loser and is useful as a reachability signal.
 	presentedToken := extractBearerToken(c)
 	presentedHash := auth.HashToken(presentedToken)
-	rotatedToken, newExpiresAt, err := maybeRotateToken(edgeID, presentedHash)
-	if errors.Is(err, ErrTokenHashMismatch) {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "token has been rotated concurrently; re-authenticate with the latest token",
-			"code":  "token_concurrently_rotated",
-		})
-	}
-	if err != nil {
-		slog.Error("poll: rotate check", "error", err, "edge_id", edgeID)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotation check failed"})
-	}
 
-	// Past the race gate. Side effects are now safe to land.
-
-	// Update Edge's reported version on every poll so the operator
-	// dashboard reflects current state without waiting for the next
-	// register. Best-effort.
-	if _, err := db.DB.Exec(`UPDATE edges SET edge_version = $1 WHERE id = $2`, req.EdgeVersion, edgeID); err != nil {
-		slog.Warn("poll: edge_version update", "error", err, "edge_id", edgeID)
-	}
-
-	// Cross-attestation: persist the counterparty's chain head.
-	// Synchronous so the audit_checkpoints row is durable before
-	// the response leaves. A write failure here breaks the
-	// tamper-evidence contract; fail loudly (codex round-3 #3).
-	if err := events.RecordAuditCheckpointSync("edge", edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, "poll"); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "failed to record audit checkpoint",
-			"code":  "checkpoint_write_failed",
-		})
-	}
-
+	// ---- Phase 2: read Vantage chain head ----
+	// Done before the tx so a chain-read failure does NOT roll
+	// back an already-prepared rotation. If this errors, no
+	// mutation has occurred — Edge can retry with the same token.
 	vantageSeq, vantageSig, err := events.LatestChainHead()
 	if err != nil {
-		// Codex round-3 finding #2: chain state is load-bearing
-		// for cross-attestation. A genesis-shaped (0/"") response
-		// would silently degrade the tamper-evidence contract
-		// from #22 Q9. Fail loudly.
 		slog.Error("poll: read vantage chain head", "error", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "failed to read chain state",
@@ -320,6 +303,105 @@ func pollEdge(c *fiber.Ctx) error {
 		})
 	}
 
+	// ---- Phase 3: single transaction for all mutations ----
+	tx, err := db.DB.Begin()
+	if err != nil {
+		slog.Error("poll: begin tx", "error", err, "edge_id", edgeID)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "transaction begin failed"})
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 3a. Lock the row and verify presented hash is current.
+	var currentHash sql.NullString
+	var expiresAt sql.NullInt64
+	if err := tx.QueryRow(
+		`SELECT token_hash, token_expires_at FROM edges WHERE id = $1 FOR UPDATE`,
+		edgeID,
+	).Scan(&currentHash, &expiresAt); err != nil {
+		slog.Error("poll: read row for update", "error", err, "edge_id", edgeID)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "row read failed"})
+	}
+	if !currentHash.Valid || currentHash.String != presentedHash {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "token has been rotated concurrently; re-authenticate with the latest token",
+			"code":  "token_concurrently_rotated",
+		})
+	}
+
+	// 3b. Rotate if within window. The UPDATE's WHERE clause
+	// re-checks token_hash so even if FOR UPDATE somehow released
+	// early, the rotation refuses on a stale row.
+	now := time.Now()
+	nowUnix := now.Unix()
+	var newPlain string
+	var newExpires int64
+	if expiresAt.Valid && expiresAt.Int64 <= now.Add(tokenRotationWindow).Unix() {
+		np, gerr := generateEdgeToken()
+		if gerr != nil {
+			slog.Error("poll: generate edge token", "error", gerr, "edge_id", edgeID)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token generation failed"})
+		}
+		nh := auth.HashToken(np)
+		ne := now.Add(edgeTokenTTL).Unix()
+		result, uerr := tx.Exec(
+			`UPDATE edges SET token_hash = $1, token_issued_at = $2, token_expires_at = $3
+			     WHERE id = $4 AND token_hash = $5`,
+			nh, nowUnix, ne, edgeID, presentedHash,
+		)
+		if uerr != nil {
+			slog.Error("poll: rotate update", "error", uerr, "edge_id", edgeID)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotation update failed"})
+		}
+		ra, raerr := result.RowsAffected()
+		if raerr != nil {
+			slog.Error("poll: rotate rowsAffected", "error", raerr)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotation verify failed"})
+		}
+		if ra == 0 {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "token has been rotated concurrently; re-authenticate with the latest token",
+				"code":  "token_concurrently_rotated",
+			})
+		}
+		newPlain, newExpires = np, ne
+	}
+
+	// 3c. Refresh reported edge_version. Inside the tx so a
+	// failure rolls back any rotation just performed.
+	if _, err := tx.Exec(`UPDATE edges SET edge_version = $1 WHERE id = $2`, req.EdgeVersion, edgeID); err != nil {
+		slog.Error("poll: edge_version update", "error", err, "edge_id", edgeID)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "edge_version update failed"})
+	}
+
+	// 3d. Persist the counterparty's audit chain head. Inline the
+	// INSERT inside the same tx (rather than calling out to
+	// RecordAuditCheckpointSync) so the row participates in the
+	// atomic commit.
+	if _, err := tx.Exec(
+		`INSERT INTO audit_checkpoints (counterparty_type, counterparty_id, chain_seq, signature, recorded_at, recorded_during)
+		     VALUES ('edge', $1, $2, $3, $4, 'poll')`,
+		edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, nowUnix,
+	); err != nil {
+		slog.Error("poll: checkpoint insert", "error", err, "edge_id", edgeID)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to record audit checkpoint",
+			"code":  "checkpoint_write_failed",
+		})
+	}
+
+	// 3e. Commit. After this point the rotation is durable.
+	if err := tx.Commit(); err != nil {
+		slog.Error("poll: commit", "error", err, "edge_id", edgeID)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "commit failed"})
+	}
+
+	// Post-commit audit (fire-and-forget). The rotation is already
+	// durable; this row is an operator-facing notification.
+	if newPlain != "" {
+		events.AuditLog("", "edge.token.rotated", "edge", edgeID, "polled within rotation window", "")
+	}
+
+	// ---- Phase 4: response ----
 	resp := fiber.Map{
 		"vantage_version": "0.1.0",
 		"audit_chain_head": fiber.Map{
@@ -330,82 +412,13 @@ func pollEdge(c *fiber.Ctx) error {
 		"next_poll_after_seconds":   defaultPollIntervalSeconds,
 		"min_required_edge_version": minimum,
 	}
-	if rotatedToken != "" {
-		resp["new_edge_token"] = rotatedToken
-		resp["new_token_expires_at"] = newExpiresAt
+	if newPlain != "" {
+		resp["new_edge_token"] = newPlain
+		resp["new_token_expires_at"] = newExpires
 	} else {
 		resp["new_edge_token"] = nil
 	}
 	return c.JSON(resp)
-}
-
-// maybeRotateToken atomically checks expiry and rotates if needed.
-// presentedTokenHash is the SHA-256 of the bearer token the request
-// arrived with. Inside the transaction we re-read token_hash with
-// a row lock and refuse to rotate if it no longer matches — a
-// concurrent poll has already rotated and this request is holding
-// a stale token. ErrTokenHashMismatch signals that case so the
-// caller can return 401 rather than overwriting the row with a
-// rotation based on an old hash.
-//
-// Returns (newPlaintext, newExpiry, nil) on a successful rotation,
-// ("", 0, nil) when no rotation was needed, or (zero, zero, err)
-// on failure (including ErrTokenHashMismatch).
-func maybeRotateToken(edgeID, presentedTokenHash string) (string, int64, error) {
-	tx, err := db.DB.Begin()
-	if err != nil {
-		return "", 0, fmt.Errorf("begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	var currentHash sql.NullString
-	var expiresAt sql.NullInt64
-	if err := tx.QueryRow(
-		`SELECT token_hash, token_expires_at FROM edges WHERE id = $1 FOR UPDATE`,
-		edgeID,
-	).Scan(&currentHash, &expiresAt); err != nil {
-		return "", 0, fmt.Errorf("read row: %w", err)
-	}
-	if !currentHash.Valid || currentHash.String != presentedTokenHash {
-		// Codex round-3 finding #1: a concurrent rotation already
-		// happened. Caller must 401 and the Edge needs to switch
-		// to whichever token won that race.
-		return "", 0, ErrTokenHashMismatch
-	}
-	if !expiresAt.Valid {
-		return "", 0, nil
-	}
-	now := time.Now()
-	threshold := now.Add(tokenRotationWindow).Unix()
-	if expiresAt.Int64 > threshold {
-		// Not yet within rotation window.
-		return "", 0, nil
-	}
-
-	newPlain, err := generateEdgeToken()
-	if err != nil {
-		return "", 0, fmt.Errorf("generate: %w", err)
-	}
-	newHash := auth.HashToken(newPlain)
-	newExpires := now.Add(edgeTokenTTL).Unix()
-	// Guard the UPDATE with the presented hash so even if a
-	// second concurrent transaction somehow slipped past the
-	// FOR UPDATE lock (shouldn't, but defense-in-depth), the
-	// WHERE clause refuses to rotate a stale row.
-	if _, err := tx.Exec(
-		`UPDATE edges
-		     SET token_hash = $1, token_issued_at = $2, token_expires_at = $3
-		     WHERE id = $4 AND token_hash = $5`,
-		newHash, now.Unix(), newExpires, edgeID, presentedTokenHash,
-	); err != nil {
-		return "", 0, fmt.Errorf("rotate update: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return "", 0, fmt.Errorf("commit: %w", err)
-	}
-
-	events.AuditLogSync("", "edge.token.rotated", "edge", edgeID, "polled within rotation window", "")
-	return newPlain, newExpires, nil
 }
 
 // registerEdge consumes an enrollment token + issues a long-lived
