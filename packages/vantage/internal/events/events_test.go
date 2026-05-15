@@ -89,7 +89,9 @@ func TestAuditLogSync_ChainContinuity(t *testing.T) {
 func TestRecordAuditCheckpoint_PersistsCounterpartyHead(t *testing.T) {
 	setupEventsTest(t)
 
-	RecordAuditCheckpointSync("edge", "edge-acme-1", 42, "abc123signaturehex", "poll")
+	if err := RecordAuditCheckpointSync("edge", "edge-acme-1", 42, "abc123signaturehex", "poll"); err != nil {
+		t.Fatalf("RecordAuditCheckpointSync: %v", err)
+	}
 
 	var ctyType, ctyID, signature, during string
 	var chainSeq int64
@@ -116,16 +118,15 @@ func TestRecordAuditCheckpoint_PersistsCounterpartyHead(t *testing.T) {
 
 // TestRecordAuditCheckpoint_RejectsBadCounterpartyType: the CHECK
 // constraint at the DB layer is what protects against a stray
-// "device" or "agent" sneaking in. The helper passes the value
-// straight through; the DB enforces.
+// "device" or "agent" sneaking in. The helper now returns the
+// error (codex round-3 #3) so callers can fail loudly.
 func TestRecordAuditCheckpoint_RejectsBadCounterpartyType(t *testing.T) {
 	setupEventsTest(t)
 
-	// Synchronous variant returns void (writes are fire-and-forget
-	// even in the Sync variant; only slog.Error indicates failure).
-	// To assert the CHECK constraint engaged, we read back and
-	// confirm no row was written.
-	RecordAuditCheckpointSync("agent", "x", 1, "sig", "noop")
+	err := RecordAuditCheckpointSync("agent", "x", 1, "sig", "noop")
+	if err == nil {
+		t.Error("CHECK constraint rejection should surface as an error from Sync")
+	}
 
 	var count int
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM audit_checkpoints`).Scan(&count); err != nil {

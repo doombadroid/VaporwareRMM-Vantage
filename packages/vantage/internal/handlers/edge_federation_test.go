@@ -971,3 +971,57 @@ func TestEdgePoll_ChainReadFailure(t *testing.T) {
 		t.Errorf("body should carry code=chain_read_failed, got %s", body)
 	}
 }
+
+// TestPoll_CheckpointWriteFails: codex round-3 finding #3. When
+// the audit_checkpoints table is unavailable (simulated by drop),
+// the synchronous checkpoint write should return an error and the
+// handler must surface 500 checkpoint_write_failed rather than
+// silently dropping the cross-attestation record.
+func TestPoll_CheckpointWriteFails(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-chkfail", "tenant-1", 25*24*time.Hour)
+	if _, err := db.DB.Exec(`DROP TABLE audit_checkpoints CASCADE`); err != nil {
+		t.Fatalf("drop audit_checkpoints: %v", err)
+	}
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("checkpoint write failure should be 500, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("checkpoint_write_failed")) {
+		t.Errorf("body should carry code=checkpoint_write_failed, got %s", body)
+	}
+}
+
+// TestEvents_CheckpointWriteFails: same coverage on /api/edge/events.
+func TestEvents_CheckpointWriteFails(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-evt-chkfail", "tenant-1", 25*24*time.Hour)
+	if _, err := db.DB.Exec(`DROP TABLE audit_checkpoints CASCADE`); err != nil {
+		t.Fatalf("drop audit_checkpoints: %v", err)
+	}
+	resp := postEdgeEventsHTTP(t, app, plain, map[string]interface{}{
+		"events": []map[string]interface{}{
+			{"correlation_id": "c1", "type": "heartbeat", "occurred_at": time.Now().Unix()},
+		},
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("events checkpoint failure should be 500, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("checkpoint_write_failed")) {
+		t.Errorf("body should carry code=checkpoint_write_failed, got %s", body)
+	}
+}

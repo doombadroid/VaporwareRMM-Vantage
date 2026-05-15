@@ -118,23 +118,27 @@ func nullable(s string) interface{} {
 	return s
 }
 
-// RecordAuditCheckpoint persists a counterparty's audit-chain head
-// for cross-attestation. Called from /api/edge/poll, /api/edge/
-// register, and /api/edge/events with the head Edge reported plus
-// a "during" tag identifying which exchange produced the record.
-//
-// Fire-and-forget like AuditLog. The checkpoint table is append-only
-// by convention; the verification CLI (Q9 v1.1) reads it linearly
-// to detect tampering — silent write failures here are exactly the
-// gap cross-attestation is meant to plug, so they get slog.Error.
+// RecordAuditCheckpoint persists a counterparty's audit-chain
+// head for cross-attestation. Fire-and-forget — checkpoint failures
+// are logged but the caller doesn't observe them. Use the Sync
+// variant from handlers that must guarantee the checkpoint landed
+// before responding.
 func RecordAuditCheckpoint(counterpartyType, counterpartyID string, chainSeq int64, signature, duringEvent string) {
-	go RecordAuditCheckpointSync(counterpartyType, counterpartyID, chainSeq, signature, duringEvent)
+	go func() {
+		_ = RecordAuditCheckpointSync(counterpartyType, counterpartyID, chainSeq, signature, duringEvent)
+	}()
 }
 
-// RecordAuditCheckpointSync is the synchronous variant for code
-// paths that need the row durable before returning (so the operator
-// or test observes the checkpoint immediately).
-func RecordAuditCheckpointSync(counterpartyType, counterpartyID string, chainSeq int64, signature, duringEvent string) {
+// RecordAuditCheckpointSync writes a checkpoint row synchronously
+// and returns the error to the caller. Codex round-3 finding #3:
+// previously this function only logged failures, which meant
+// "Sync" callers (poll/events) couldn't enforce durability-
+// before-response.
+//
+// Callers should fail the request when this returns non-nil so the
+// Edge knows the checkpoint didn't land and can retry. Otherwise
+// the cross-attestation contract from #22 Q9 silently degrades.
+func RecordAuditCheckpointSync(counterpartyType, counterpartyID string, chainSeq int64, signature, duringEvent string) error {
 	if _, err := db.DB.Exec(
 		`INSERT INTO audit_checkpoints
 		     (counterparty_type, counterparty_id, chain_seq, signature, recorded_at, recorded_during)
@@ -148,7 +152,9 @@ func RecordAuditCheckpointSync(counterpartyType, counterpartyID string, chainSeq
 			"chain_seq", chainSeq,
 			"during", duringEvent,
 		)
+		return fmt.Errorf("checkpoint write: %w", err)
 	}
+	return nil
 }
 
 // WSBroadcastMessage is the placeholder for the F2 real-time fan-out.

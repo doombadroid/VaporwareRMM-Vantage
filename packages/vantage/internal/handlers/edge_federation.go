@@ -161,7 +161,12 @@ func postEdgeEvents(c *fiber.Ctx) error {
 
 	edgeID, _ := c.Locals("edge_id").(string)
 
-	events.RecordAuditCheckpointSync("edge", edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, "events")
+	if err := events.RecordAuditCheckpointSync("edge", edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, "events"); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to record audit checkpoint",
+			"code":  "checkpoint_write_failed",
+		})
+	}
 
 	type rejection struct {
 		CorrelationID string `json:"correlation_id"`
@@ -268,8 +273,14 @@ func pollEdge(c *fiber.Ctx) error {
 
 	// Cross-attestation: persist the counterparty's chain head.
 	// Synchronous so the audit_checkpoints row is durable before
-	// the response leaves.
-	events.RecordAuditCheckpointSync("edge", edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, "poll")
+	// the response leaves. A write failure here breaks the
+	// tamper-evidence contract; fail loudly (codex round-3 #3).
+	if err := events.RecordAuditCheckpointSync("edge", edgeID, req.AuditChainHead.Seq, req.AuditChainHead.Signature, "poll"); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to record audit checkpoint",
+			"code":  "checkpoint_write_failed",
+		})
+	}
 
 	// Token rotation. Re-hash the bearer the request arrived with;
 	// maybeRotateToken's tx revalidates that hash against the row
