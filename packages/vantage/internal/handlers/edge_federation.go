@@ -439,7 +439,12 @@ func registerEdge(c *fiber.Ctx) error {
 		if consumedAt.Valid {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "enrollment token already consumed"})
 		}
-		if expiresAt < nowUnix {
+		// The atomic UPDATE's WHERE uses `expires_at > $1` (strict).
+		// A row with expires_at == nowUnix fails the UPDATE but
+		// would also fail this diagnostic's `<` and fall to the
+		// "unreachable" 500. Use `<=` here so the diagnostic
+		// matches the UPDATE's notion of "alive vs not".
+		if expiresAt <= nowUnix {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "enrollment token expired"})
 		}
 		// Row exists, not consumed, not expired — yet the UPDATE

@@ -179,3 +179,24 @@ func TestEdgeAuthMiddleware_AcceptsAnyClientIP(t *testing.T) {
 		t.Errorf("valid token should auth regardless of source IP; got %d", resp.StatusCode)
 	}
 }
+
+// TestEdgeAuthMiddleware_TokenExactlyAtExpiry: codex finding #7.
+// A token whose token_expires_at lands on exactly the current
+// second was previously routed to the "unreachable" 500 path
+// because of a `<` comparison. The fix is `<=` — exactly-at-
+// expiry tokens are expired, full stop.
+func TestEdgeAuthMiddleware_TokenExactlyAtExpiry(t *testing.T) {
+	app := edgeAuthEnv(t)
+	plain := seedEdge(t, "edge-exact-expiry", "tenant-x", "", "active", 0)
+	// Force token_expires_at to be exactly time.Now().Unix() at
+	// the moment the middleware checks. The middleware computes
+	// time.Now().Unix() each request; this test asserts the row
+	// gets refused even if the comparison stamps the same second.
+	_, _ = db.DB.Exec(`UPDATE edges SET token_expires_at = $1 WHERE id = 'edge-exact-expiry'`, time.Now().Unix())
+
+	resp, _ := app.Test(authedRequest(plain), -1)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("token exactly at expiry should be 401, got %d", resp.StatusCode)
+	}
+}

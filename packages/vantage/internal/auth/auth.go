@@ -443,7 +443,12 @@ func EdgeAuthMiddleware() fiber.Handler {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "auth lookup failed"})
 		}
 
-		if tokenExpiresAt.Valid && tokenExpiresAt.Int64 < time.Now().Unix() {
+		// Boundary semantics: a token whose token_expires_at lands
+		// on exactly the current second is expired. The pre-fix `<`
+		// comparison routed exactly-at-expiry tokens to the
+		// downstream "unreachable" 500 path. <= treats the boundary
+		// as expired consistently.
+		if tokenExpiresAt.Valid && tokenExpiresAt.Int64 <= time.Now().Unix() {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "edge token expired", "code": 401})
 		}
 
