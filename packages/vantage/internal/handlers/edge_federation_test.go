@@ -664,16 +664,22 @@ func TestEdgePoll_TokenRotation_OldTokenImmediatelyInvalid(t *testing.T) {
 	}
 }
 
-// TestEdgeRegister_RateLimitPerToken: hammer /register with the
-// same enrollment_token. After 10 attempts in a minute the 11th
-// should hit the rate limit (429) — not 401. Proves the limiter
-// is per-token, not per-attempt.
-func TestEdgeRegister_RateLimitPerToken(t *testing.T) {
+// Codex round-6 #1: rate limiters are now chained — per-IP
+// (Max=30) AND per-token (Max=5). The earlier per-token-only
+// limiter weakened brute-force resistance (each guess got its own
+// bucket); the earlier per-IP-only limiter collapsed callers
+// behind reverse proxies. Both protect different attack surfaces;
+// both apply.
+
+// TestRegister_TokenLimit: 6 requests with the same enrollment_
+// token. tokenLimiter Max=5 → 5 reach handler (401 unknown), 1
+// gets 429.
+func TestRegister_TokenLimit(t *testing.T) {
 	app := edgeFederationEnv(t)
 	const sameToken = "vrt_unknown_burner"
 
-	statuses := make([]int, 11)
-	for i := 0; i < 11; i++ {
+	statuses := make([]int, 6)
+	for i := 0; i < 6; i++ {
 		resp := postEdgeRegister(t, app, map[string]string{
 			"enrollment_token": sameToken,
 			"edge_version":     "0.1.0",
@@ -681,44 +687,90 @@ func TestEdgeRegister_RateLimitPerToken(t *testing.T) {
 		statuses[i] = resp.StatusCode
 		resp.Body.Close()
 	}
-	limit429Count := 0
-	auth401Count := 0
+	limit429, auth401 := 0, 0
 	for _, s := range statuses {
 		switch s {
 		case http.StatusTooManyRequests:
-			limit429Count++
+			limit429++
 		case http.StatusUnauthorized:
-			auth401Count++
+			auth401++
 		}
 	}
-	if auth401Count != 10 {
-		t.Errorf("expected first 10 attempts to be 401, got auth401Count=%d (statuses: %v)", auth401Count, statuses)
+	if auth401 != 5 {
+		t.Errorf("expected first 5 attempts to be 401, got %d (statuses: %v)", auth401, statuses)
 	}
-	if limit429Count != 1 {
-		t.Errorf("expected exactly one 429 (11th), got %d (statuses: %v)", limit429Count, statuses)
+	if limit429 != 1 {
+		t.Errorf("expected exactly one 429 (6th), got %d (statuses: %v)", limit429, statuses)
 	}
 }
 
-// TestEdgeRegister_RateLimitScopedPerToken: 11 distinct tokens
-// from a single source — each gets its own bucket so none of
-// them should hit the limit. Proves the limiter is NOT collapsing
-// to per-IP buckets (which would have rejected the 11th).
-func TestEdgeRegister_RateLimitScopedPerToken(t *testing.T) {
+// TestRegister_IPLimit: 31 requests, each with a DIFFERENT token,
+// from the same IP. tokenLimiter is per-token so each request
+// has its own token bucket. ipLimiter Max=30 → 30 reach handler,
+// 31st gets 429.
+func TestRegister_IPLimit(t *testing.T) {
 	app := edgeFederationEnv(t)
-
-	statuses := make([]int, 11)
-	for i := 0; i < 11; i++ {
+	statuses := make([]int, 31)
+	for i := 0; i < 31; i++ {
 		resp := postEdgeRegister(t, app, map[string]string{
-			"enrollment_token": fmt.Sprintf("vrt_distinct_burner_%d", i),
+			"enrollment_token": fmt.Sprintf("vrt_ip_burner_%d", i),
 			"edge_version":     "0.1.0",
 		})
 		statuses[i] = resp.StatusCode
 		resp.Body.Close()
 	}
-	for i, s := range statuses {
-		if s == http.StatusTooManyRequests {
-			t.Errorf("request %d hit 429; per-token bucket should have allowed it (statuses: %v)", i, statuses)
+	limit429, auth401 := 0, 0
+	for _, s := range statuses {
+		switch s {
+		case http.StatusTooManyRequests:
+			limit429++
+		case http.StatusUnauthorized:
+			auth401++
 		}
+	}
+	if auth401 != 30 {
+		t.Errorf("expected 30 attempts to reach handler, got %d (statuses: %v)", auth401, statuses)
+	}
+	if limit429 != 1 {
+		t.Errorf("expected 1 × 429 from ipLimiter, got %d (statuses: %v)", limit429, statuses)
+	}
+}
+
+// TestRegister_BothLimitsRespected: 5 same-token attempts (each
+// hits tokenLimiter exactly at the limit), repeated for 6 distinct
+// tokens. Token-1 through token-6, 5 each. tokenLimiter Max=5
+// means all 5 of each token pass that gate. Combined: 30 requests
+// pass tokenLimiter. ipLimiter Max=30 means all 30 pass.
+// Continuing: 5 more same-token attempts on token-7 (so 35 total
+// requests). tokenLimiter passes 5. ipLimiter — at request 31 —
+// returns 429.
+func TestRegister_BothLimitsRespected(t *testing.T) {
+	app := edgeFederationEnv(t)
+	statuses := []int{}
+	for tok := 0; tok < 7; tok++ {
+		for try := 0; try < 5; try++ {
+			resp := postEdgeRegister(t, app, map[string]string{
+				"enrollment_token": fmt.Sprintf("vrt_combo_%d", tok),
+				"edge_version":     "0.1.0",
+			})
+			statuses = append(statuses, resp.StatusCode)
+			resp.Body.Close()
+		}
+	}
+	auth401, limit429 := 0, 0
+	for _, s := range statuses {
+		switch s {
+		case http.StatusUnauthorized:
+			auth401++
+		case http.StatusTooManyRequests:
+			limit429++
+		}
+	}
+	if auth401 != 30 {
+		t.Errorf("expected 30 × 401 (first 6 tokens × 5 attempts) before ipLimiter trips, got %d (statuses: %v)", auth401, statuses)
+	}
+	if limit429 != 5 {
+		t.Errorf("expected 5 × 429 from ipLimiter on the 7th token's 5 attempts, got %d (statuses: %v)", limit429, statuses)
 	}
 }
 

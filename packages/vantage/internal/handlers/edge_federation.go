@@ -64,49 +64,47 @@ const tokenRotationWindow = 7 * 24 * time.Hour
 // authed routes (commits 10/11) get wired through their own
 // middleware chain.
 func RegisterEdgeRoutes(app *fiber.App) {
-	// Per-enrollment-token limiter on register. Codex finding #3
-	// flagged that c.IP() collapses to the reverse proxy's address
-	// behind Caddy, making per-IP buckets useless. Key by a hash
-	// of the enrollment_token from the request body so the limit
-	// is "10 attempts on this specific token per minute" — the
-	// attack surface the limit actually defends against (brute-
-	// forcing a known-issued enrollment token).
-	//
-	// Body-parse note: Fiber caches the request body in
-	// c.Request().Body() and re-reads on every BodyParser call,
-	// so the downstream handler can still parse normally after
-	// the KeyGenerator peeks at it.
-	//
-	// Multi-node note (#22 Q10): Fiber's default limiter is
-	// in-memory per process. With multi-node Vantage, each node
-	// enforces its own quota — total fleet quota is N * 10 per
-	// token per minute. A Redis-backed limiter is the upgrade
-	// path; F2 ships in-memory since single-node is the v1
-	// deployment.
-	registerLimiter := limiter.New(limiter.Config{
-		Max:        10,
+	// Two chained rate limiters on /register (codex round-6 #1).
+	// Per-IP catches brute-force iteration across guessed tokens;
+	// per-token catches repeated attempts on a specific token.
+	// Round-1 fix moved to per-token only, which actually weakened
+	// brute-force resistance because each guess got its own bucket.
+	// The right answer is both — and per-IP requires Fiber's
+	// TrustedProxies config to see the real client IP behind
+	// Caddy (configured in main.go).
+	limitReached := func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+			"error": "rate limit exceeded; slow down",
+			"code":  429,
+		})
+	}
+	ipLimiter := limiter.New(limiter.Config{
+		Max:        30, // legitimate operators may register many edges from one bastion
+		Expiration: time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return "ip:" + c.IP()
+		},
+		LimitReached: limitReached,
+	})
+	tokenLimiter := limiter.New(limiter.Config{
+		Max:        5,
 		Expiration: time.Minute,
 		KeyGenerator: func(c *fiber.Ctx) string {
 			var body struct {
 				EnrollmentToken string `json:"enrollment_token"`
 			}
 			if err := c.BodyParser(&body); err != nil {
-				return "ip:" + c.IP()
+				return "tok:malformed"
 			}
 			if body.EnrollmentToken == "" {
-				return "ip:" + c.IP()
+				return "tok:empty"
 			}
 			sum := sha256.Sum256([]byte(body.EnrollmentToken))
 			return "tok:" + hex.EncodeToString(sum[:])[:16]
 		},
-		LimitReached: func(c *fiber.Ctx) error {
-			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-				"error": "rate limit exceeded; slow down",
-				"code":  429,
-			})
-		},
+		LimitReached: limitReached,
 	})
-	app.Post("/api/edge/register", registerLimiter, registerEdge)
+	app.Post("/api/edge/register", ipLimiter, tokenLimiter, registerEdge)
 
 	// Authed federation endpoints. Edge presents Bearer token;
 	// EdgeAuthMiddleware validates + attaches edge_id/tenant_id/

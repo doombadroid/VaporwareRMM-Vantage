@@ -54,13 +54,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	// TrustedProxies (codex round-6 #1): without this, Fiber treats
+	// X-Forwarded-For/X-Real-IP as untrusted and c.IP() returns the
+	// connecting peer (Caddy in production), collapsing every
+	// rate-limit bucket. TRUSTED_PROXIES env carries a CSV of CIDRs
+	// or IPs we accept the forwarded headers from.
+	trustedProxies := splitAndTrim(os.Getenv("TRUSTED_PROXIES"), ",")
+	enableTrustedProxy := len(trustedProxies) > 0
+	if !enableTrustedProxy {
+		slog.Warn("TRUSTED_PROXIES not set; rate limiting may collapse callers behind reverse proxies. " +
+			"Set to your proxy's IP range (e.g., 127.0.0.1/32 for co-located Caddy).")
+	}
+
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
 		AppName:               "vaporrmm-vantage",
 		// Limit body sizes to a reasonable max — federation
 		// payloads in F2-F8 won't exceed this; bigger bodies are
 		// almost certainly malformed.
-		BodyLimit: 10 * 1024 * 1024,
+		BodyLimit:               10 * 1024 * 1024,
+		EnableTrustedProxyCheck: enableTrustedProxy,
+		TrustedProxies:          trustedProxies,
+		ProxyHeader:             fiber.HeaderXForwardedFor,
 	})
 	app.Use(recover.New())
 	app.Use(logger.New(logger.Config{

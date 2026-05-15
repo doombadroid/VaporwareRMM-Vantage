@@ -65,6 +65,7 @@ Open `http://localhost` in a browser, log in as `admin@vaporrmm-vantage.local` w
 | `VANTAGE_PUBLIC_URL` | yes | External URL operators reach Vantage at — embedded in enrollment bundles + used for the cookie-secure sanity check. Must have scheme + host (e.g. `https://vantage.yourtailnet.ts.net`). Must be `https://` unless `FORCE_SECURE_COOKIES=false`. Vantage refuses to start on invalid values. |
 | `FORCE_SECURE_COOKIES` | no | Default `true`. Set `false` only for local-dev iteration over `http://localhost`. Combination of `false` + `https://` `VANTAGE_PUBLIC_URL` is rejected at boot — that combination would leak auth cookies cleartext. |
 | `MINIMUM_REQUIRED_EDGE_VERSION` | no | Floor for federated Edge handshake. Empty = no floor. Must be a valid semver (e.g. `0.1.0` or `v0.1.0`) — invalid values are rejected at boot. |
+| `TRUSTED_PROXIES` | no (yes behind a proxy) | CSV of CIDRs/IPs whose `X-Forwarded-For` Fiber will trust for `c.IP()`. Required for per-IP rate limiting to work behind Caddy. Default `127.0.0.1/32` for co-located Caddy in compose. Unset = no proxy trust + warning logged at startup. |
 
 ## Quick start (dev, no Docker)
 
