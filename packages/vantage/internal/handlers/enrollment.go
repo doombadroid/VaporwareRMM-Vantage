@@ -126,8 +126,13 @@ func mintEnrollmentToken(c *fiber.Ctx) error {
 		})
 	}
 
+	// CAS on tailscale_auth_key_id (codex round-6 sweep): the row
+	// was inserted with NULL just above. If something else races
+	// in to fill the column, the WHERE clause refuses to overwrite.
+	// Single-handler INSERT-then-UPDATE shouldn't race in practice;
+	// the CAS is defense-in-depth.
 	if _, err := db.DB.Exec(
-		`UPDATE enrollment_tokens SET tailscale_auth_key_id = $1 WHERE id = $2`,
+		`UPDATE enrollment_tokens SET tailscale_auth_key_id = $1 WHERE id = $2 AND tailscale_auth_key_id IS NULL`,
 		authKey.ID, id,
 	); err != nil {
 		// Compensation: revoke the Tailscale key we just minted —

@@ -539,11 +539,24 @@ func BootstrapAdmin() error {
 		return fmt.Errorf("hash admin password: %w", err)
 	}
 	id := uuid.New().String()
-	if _, err := db.DB.Exec(
-		`INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, 'super_admin')`,
+	// ON CONFLICT (email): codex round-6 sweep caught a multi-
+	// process boot race where two nodes both observe count=0 and
+	// both INSERT. The second-runner would have crashed on the
+	// email UNIQUE constraint. ON CONFLICT DO NOTHING lets the
+	// race-loser silently no-op; admin exists either way.
+	result, err := db.DB.Exec(
+		`INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, 'super_admin') ON CONFLICT (email) DO NOTHING`,
 		id, "admin@vaporrmm-vantage.local", hash,
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("insert admin: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		// Race-lost: another booting node already created the
+		// admin. Don't print "FIRST-RUN ADMIN PASSWORD" — the
+		// winner already did.
+		slog.Info("admin bootstrap: row already existed (race-lost on concurrent boot); no first-run banner emitted")
+		return nil
 	}
 	if generated {
 		// Print to stdout (not slog) so it doesn't get tangled in
