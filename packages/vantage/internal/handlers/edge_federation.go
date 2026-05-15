@@ -232,14 +232,19 @@ func pollEdge(c *fiber.Ctx) error {
 	minimum := os.Getenv("MINIMUM_REQUIRED_EDGE_VERSION")
 	ok, err := versionAtLeast(req.EdgeVersion, minimum)
 	if err != nil {
+		// Server-side MINIMUM_REQUIRED_EDGE_VERSION is validated
+		// at boot (ValidateMinEdgeVersion in version.go), so any
+		// versionAtLeast error here is unambiguously the client
+		// sending a malformed edge_version.
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "malformed edge_version: " + err.Error(),
+			"code":  "invalid_edge_version",
 		})
 	}
 	if !ok {
 		return c.Status(fiber.StatusUpgradeRequired).JSON(fiber.Map{
-			"error":                fmt.Sprintf("edge_version %s below minimum %s", req.EdgeVersion, minimum),
-			"code":                 426,
+			"error":                "edge version below minimum required",
+			"code":                 "edge_version_below_minimum",
 			"required_min_version": minimum,
 			"current_version":      req.EdgeVersion,
 		})
@@ -360,14 +365,18 @@ func registerEdge(c *fiber.Ctx) error {
 	minimum := os.Getenv("MINIMUM_REQUIRED_EDGE_VERSION")
 	ok, err := versionAtLeast(req.EdgeVersion, minimum)
 	if err != nil {
+		// MINIMUM_REQUIRED_EDGE_VERSION is validated at boot
+		// (ValidateMinEdgeVersion), so any error here is the
+		// client sending a malformed edge_version.
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "malformed edge_version: " + err.Error(),
+			"code":  "invalid_edge_version",
 		})
 	}
 	if !ok {
 		return c.Status(fiber.StatusUpgradeRequired).JSON(fiber.Map{
-			"error":                fmt.Sprintf("edge_version %s below minimum %s; update Edge before continuing", req.EdgeVersion, minimum),
-			"code":                 426,
+			"error":                "edge version below minimum required",
+			"code":                 "edge_version_below_minimum",
 			"required_min_version": minimum,
 			"current_version":      req.EdgeVersion,
 		})

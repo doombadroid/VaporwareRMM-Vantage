@@ -1,6 +1,9 @@
 package handlers
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestVersionAtLeast covers the SemVer rules the federation
 // handshake relies on. Prerelease ordering is the key fix from
@@ -58,5 +61,38 @@ func TestVersionAtLeast_RejectsMalformed(t *testing.T) {
 func TestVersionAtLeast_MissingCandidate(t *testing.T) {
 	if _, err := versionAtLeast("", "0.1.0"); err == nil {
 		t.Error("missing candidate should error when minimum is set")
+	}
+}
+
+// Codex findings #5/#6: MINIMUM_REQUIRED_EDGE_VERSION must be
+// validated at startup so handler-side versionAtLeast errors are
+// unambiguously client-side.
+
+func TestValidateMinEdgeVersion_RefusesInvalid(t *testing.T) {
+	t.Setenv("MINIMUM_REQUIRED_EDGE_VERSION", "nonsense")
+	err := ValidateMinEdgeVersion()
+	if err == nil {
+		t.Fatal("expected error for nonsense version")
+	}
+	if !strings.Contains(err.Error(), "MINIMUM_REQUIRED_EDGE_VERSION") {
+		t.Errorf("error should name the env var; got %v", err)
+	}
+}
+
+func TestValidateMinEdgeVersion_AcceptsValid(t *testing.T) {
+	for _, ver := range []string{"0.1.0", "v0.1.0", "1.2.3", "1.0.0-rc.1"} {
+		t.Run(ver, func(t *testing.T) {
+			t.Setenv("MINIMUM_REQUIRED_EDGE_VERSION", ver)
+			if err := ValidateMinEdgeVersion(); err != nil {
+				t.Errorf("ValidateMinEdgeVersion(%q) returned %v", ver, err)
+			}
+		})
+	}
+}
+
+func TestValidateMinEdgeVersion_EmptyMeansNoFloor(t *testing.T) {
+	t.Setenv("MINIMUM_REQUIRED_EDGE_VERSION", "")
+	if err := ValidateMinEdgeVersion(); err != nil {
+		t.Errorf("empty min version should be accepted, got %v", err)
 	}
 }

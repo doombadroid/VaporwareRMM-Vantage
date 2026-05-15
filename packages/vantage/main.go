@@ -49,6 +49,10 @@ func main() {
 		slog.Error("signing keypair bootstrap failed; refusing to start", "error", err)
 		os.Exit(1)
 	}
+	if err := handlers.ValidateMinEdgeVersion(); err != nil {
+		slog.Error("MINIMUM_REQUIRED_EDGE_VERSION invalid; refusing to start", "error", err)
+		os.Exit(1)
+	}
 
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,

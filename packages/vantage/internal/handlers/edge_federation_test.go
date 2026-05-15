@@ -812,3 +812,40 @@ func TestEvents_MissingSignature(t *testing.T) {
 		t.Errorf("events with missing signature should be 400, got %d", resp.StatusCode)
 	}
 }
+
+func TestEdgeRegister_MalformedClientVersion(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEnrollment(t, "tenant-malf", time.Hour)
+	resp := postEdgeRegister(t, app, map[string]string{
+		"enrollment_token": plain,
+		"edge_version":     "totally-not-a-version",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("malformed edge_version should be 400, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("invalid_edge_version")) {
+		t.Errorf("body should carry code=invalid_edge_version, got %s", body)
+	}
+}
+
+func TestEdgePoll_MalformedClientVersion(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-malf", "tenant-1", 25*24*time.Hour)
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "🙃-not-semver",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("malformed edge_version on poll should be 400, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("invalid_edge_version")) {
+		t.Errorf("body should carry code=invalid_edge_version, got %s", body)
+	}
+}
