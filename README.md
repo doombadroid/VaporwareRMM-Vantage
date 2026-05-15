@@ -28,11 +28,13 @@ POSTGRES_PASSWORD=$(openssl rand -hex 24)
 JWT_SECRET=$(openssl rand -base64 48)
 SECRETS_ENCRYPTION_KEY=$(openssl rand -base64 32)
 ADMIN_PASSWORD='YourStrongPw!2026'    # >=12 chars, upper/lower/digit/special
+VANTAGE_PUBLIC_URL='https://vantage.yourtailnet.ts.net'   # tailnet-routable URL Edges reach Vantage at
 sed -i \
   -e "s|POSTGRES_PASSWORD=__GENERATE_ME__|POSTGRES_PASSWORD=$POSTGRES_PASSWORD|" \
   -e "s|JWT_SECRET=__GENERATE_ME__|JWT_SECRET=$JWT_SECRET|" \
   -e "s|SECRETS_ENCRYPTION_KEY=__GENERATE_ME__|SECRETS_ENCRYPTION_KEY=$SECRETS_ENCRYPTION_KEY|" \
   -e "s|ADMIN_PASSWORD=__GENERATE_ME__|ADMIN_PASSWORD=$ADMIN_PASSWORD|" \
+  -e "s|VANTAGE_PUBLIC_URL=__GENERATE_ME__|VANTAGE_PUBLIC_URL=$VANTAGE_PUBLIC_URL|" \
   .env
 
 # 2. Boot
@@ -60,7 +62,7 @@ Open `http://localhost` in a browser, log in as `admin@vaporrmm-vantage.local` w
 | `ACME_EMAIL` | no | Let's Encrypt contact. Required if `DOMAIN` is a real public name. |
 | `BIND_ADDR` | no | Caddy publishes on this address. Default `127.0.0.1` (Tailscale-only access); `0.0.0.0` for public. |
 | `VANTAGE_PORT` | no | Override the internal :9090 port. Useful only for non-compose deployments. |
-| `VANTAGE_PUBLIC_URL` | no | External URL operators paste into enrollment bundles. Used by the `FORCE_SECURE_COOKIES` sanity check. |
+| `VANTAGE_PUBLIC_URL` | yes | External URL operators reach Vantage at — embedded in enrollment bundles + used for the cookie-secure sanity check. Must have scheme + host (e.g. `https://vantage.yourtailnet.ts.net`). Must be `https://` unless `FORCE_SECURE_COOKIES=false`. Vantage refuses to start on invalid values. |
 | `FORCE_SECURE_COOKIES` | no | Default `true`. Set `false` only for local-dev iteration over `http://localhost`. Combination of `false` + `https://` `VANTAGE_PUBLIC_URL` is rejected at boot — that combination would leak auth cookies cleartext. |
 | `MINIMUM_REQUIRED_EDGE_VERSION` | no | Floor for federated Edge handshake. Empty = no floor. Must be a valid semver (e.g. `0.1.0` or `v0.1.0`) — invalid values are rejected at boot. |
 

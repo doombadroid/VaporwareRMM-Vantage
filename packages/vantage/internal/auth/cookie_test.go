@@ -92,3 +92,61 @@ func TestInit_AcceptsHTTPPublicURLWithInsecureCookies(t *testing.T) {
 		t.Fatalf("Init should accept dev opt-out + http URL; got %v", err)
 	}
 }
+
+// VANTAGE_PUBLIC_URL boot validation (codex round-5 #3).
+
+func TestInit_RefusesEmptyPublicURL(t *testing.T) {
+	t.Setenv("JWT_SECRET", strings.Repeat("a", 64))
+	t.Setenv("VANTAGE_PUBLIC_URL", "")
+	err := Init()
+	if err == nil {
+		t.Fatal("Init should refuse empty VANTAGE_PUBLIC_URL")
+	}
+	if !strings.Contains(err.Error(), "VANTAGE_PUBLIC_URL") {
+		t.Errorf("error should name VANTAGE_PUBLIC_URL; got: %v", err)
+	}
+}
+
+func TestInit_RefusesMalformedPublicURL(t *testing.T) {
+	t.Setenv("JWT_SECRET", strings.Repeat("a", 64))
+	// No scheme — url.Parse returns Scheme="", Host="".
+	t.Setenv("VANTAGE_PUBLIC_URL", "vantage.example.com")
+	err := Init()
+	if err == nil {
+		t.Fatal("Init should refuse malformed URL")
+	}
+	if !strings.Contains(err.Error(), "not a valid URL") {
+		t.Errorf("error should say 'not a valid URL'; got: %v", err)
+	}
+}
+
+func TestInit_RefusesHTTPInProduction(t *testing.T) {
+	t.Setenv("JWT_SECRET", strings.Repeat("a", 64))
+	t.Setenv("FORCE_SECURE_COOKIES", "") // default = secure
+	t.Setenv("VANTAGE_PUBLIC_URL", "http://vantage.example.com")
+	err := Init()
+	if err == nil {
+		t.Fatal("Init should refuse http URL when FORCE_SECURE_COOKIES is default-true")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("error should mention https requirement; got: %v", err)
+	}
+}
+
+func TestInit_AcceptsValidHTTPS(t *testing.T) {
+	t.Setenv("JWT_SECRET", strings.Repeat("a", 64))
+	t.Setenv("FORCE_SECURE_COOKIES", "")
+	t.Setenv("VANTAGE_PUBLIC_URL", "https://vantage.example.com")
+	if err := Init(); err != nil {
+		t.Fatalf("Init should accept valid https URL; got %v", err)
+	}
+}
+
+func TestInit_AcceptsHTTPInDevMode(t *testing.T) {
+	t.Setenv("JWT_SECRET", strings.Repeat("a", 64))
+	t.Setenv("FORCE_SECURE_COOKIES", "false")
+	t.Setenv("VANTAGE_PUBLIC_URL", "http://localhost:9090")
+	if err := Init(); err != nil {
+		t.Fatalf("Init should accept http URL in dev mode; got %v", err)
+	}
+}

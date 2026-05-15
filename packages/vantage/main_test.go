@@ -74,6 +74,13 @@ func resetForTest(t *testing.T) string {
 
 func newAppForTest(t *testing.T) *fiber.App {
 	t.Helper()
+	// VANTAGE_PUBLIC_URL is required by auth.Init() (codex
+	// round-5 #3). Set a default for tests that don't care; tests
+	// that exercise the validation set their own value first via
+	// t.Setenv before calling newAppForTest.
+	if os.Getenv("VANTAGE_PUBLIC_URL") == "" {
+		t.Setenv("VANTAGE_PUBLIC_URL", "https://vantage.test.local")
+	}
 	if err := auth.Init(); err != nil {
 		t.Fatalf("auth.Init: %v", err)
 	}

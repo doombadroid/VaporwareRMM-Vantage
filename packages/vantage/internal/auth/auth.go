@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -89,21 +90,43 @@ func Init() error {
 	}
 	JWTSecret = []byte(sec)
 
-	// Cookie-secure sanity check: refuse to boot when the deployment
-	// looks production-like (VANTAGE_PUBLIC_URL is https) but the
-	// operator has set FORCE_SECURE_COOKIES=false. That combination
-	// is almost always a misconfiguration — a dev opt-out leaking
-	// into a production env file.
-	if os.Getenv("FORCE_SECURE_COOKIES") == "false" {
-		publicURL := strings.ToLower(os.Getenv("VANTAGE_PUBLIC_URL"))
-		if strings.HasPrefix(publicURL, "https://") {
-			return errors.New(
-				"refusing to boot: FORCE_SECURE_COOKIES=false but VANTAGE_PUBLIC_URL starts with https:// — " +
-					"the combination would issue non-Secure auth cookies to a TLS deployment. " +
-					"Unset FORCE_SECURE_COOKIES (defaults to true) for production, or set VANTAGE_PUBLIC_URL " +
-					"to an http:// URL if this really is local development",
-			)
+	// VANTAGE_PUBLIC_URL validation (codex round-5 #3). Required
+	// non-empty + parseable + scheme/host present. The handler-time
+	// uses ("vantage_url" in the enrollment bundle, cookie-secure
+	// cross-check) expect a valid URL, so we refuse to boot rather
+	// than ship malformed values into operator-facing artifacts.
+	publicURL := os.Getenv("VANTAGE_PUBLIC_URL")
+	if publicURL == "" {
+		return errors.New(
+			"VANTAGE_PUBLIC_URL is required. Set to the tailnet-routable URL Edges will reach Vantage at, e.g. https://vantage.yourtailnet.ts.net",
+		)
+	}
+	parsed, err := neturl.Parse(publicURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		errStr := ""
+		if err != nil {
+			errStr = ": " + err.Error()
 		}
+		return fmt.Errorf(
+			"VANTAGE_PUBLIC_URL=%q is not a valid URL (need scheme and host, e.g. https://vantage.yourtailnet.ts.net)%s",
+			publicURL, errStr,
+		)
+	}
+	secureCookies := os.Getenv("FORCE_SECURE_COOKIES") != "false"
+	scheme := strings.ToLower(parsed.Scheme)
+	if secureCookies && scheme != "https" {
+		return fmt.Errorf(
+			"VANTAGE_PUBLIC_URL=%q must use https in production. Use http only with FORCE_SECURE_COOKIES=false (local dev).",
+			publicURL,
+		)
+	}
+	if !secureCookies && scheme == "https" {
+		return errors.New(
+			"refusing to boot: FORCE_SECURE_COOKIES=false but VANTAGE_PUBLIC_URL is https — " +
+				"the combination would issue non-Secure auth cookies to a TLS deployment. " +
+				"Unset FORCE_SECURE_COOKIES (defaults to true) for production, or set VANTAGE_PUBLIC_URL " +
+				"to an http:// URL if this really is local development",
+		)
 	}
 	return nil
 }
