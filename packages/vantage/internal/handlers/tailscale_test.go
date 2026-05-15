@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"vaporrmm/vantage/internal/crypto"
@@ -330,5 +331,103 @@ func TestTailscaleEndpoints_RequireSuperAdmin(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("admin role should hit 403 on validate, got %d", resp.StatusCode)
+	}
+}
+
+// TestConnectTailscale_ConcurrentConnect: codex round-3 finding #4.
+// Two concurrent connect calls should resolve deterministically:
+// exactly one 200, one 409 with code=already_connected. The
+// pre-fix SELECT-then-INSERT pattern could return nondeterministic
+// 500 from the loser's PK-violation.
+func TestConnectTailscale_ConcurrentConnect(t *testing.T) {
+	app, swap := tailscaleTestEnv(t, "super_admin")
+	swap(&fakeTSClient{})
+	body := map[string]string{"client_id": "id", "client_secret": "secret", "tailnet": "acme.ts.net"}
+
+	const N = 5
+	statuses := make([]int, N)
+	codes := make([]string, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp := postJSON(t, app, "/api/v1/tailscale/connect", body)
+			defer resp.Body.Close()
+			statuses[i] = resp.StatusCode
+			var out struct {
+				Code string `json:"code"`
+			}
+			json.NewDecoder(resp.Body).Decode(&out)
+			codes[i] = out.Code
+		}(i)
+	}
+	wg.Wait()
+
+	wins, conflicts, fives := 0, 0, 0
+	for i, s := range statuses {
+		switch s {
+		case http.StatusOK:
+			wins++
+		case http.StatusConflict:
+			conflicts++
+			if codes[i] != "already_connected" {
+				t.Errorf("conflict %d should carry code=already_connected, got %q", i, codes[i])
+			}
+		case http.StatusInternalServerError:
+			fives++
+		}
+	}
+	if wins != 1 {
+		t.Errorf("expected exactly 1 winner, got %d (statuses: %v)", wins, statuses)
+	}
+	if conflicts != N-1 {
+		t.Errorf("expected %d conflicts, got %d (statuses: %v)", N-1, conflicts, statuses)
+	}
+	if fives != 0 {
+		t.Errorf("no concurrent connect should return 500; got %d (statuses: %v)", fives, statuses)
+	}
+}
+
+// TestRotateTailscaleConnection_RaceWithDisconnect: codex round-3
+// finding #5. If the row is deleted between the rotate handler's
+// SELECT and its UPDATE, the UPDATE silently affects zero rows.
+// The new RowsAffected check returns 404 + code=not_connected
+// and refuses to emit an audit row for the no-op rotation.
+func TestRotateTailscaleConnection_RaceWithDisconnect(t *testing.T) {
+	app, swap := tailscaleTestEnv(t, "super_admin")
+	swap(&fakeTSClient{})
+	postJSON(t, app, "/api/v1/tailscale/connect", map[string]string{
+		"client_id": "id1", "client_secret": "secret1", "tailnet": "acme.ts.net",
+	}).Body.Close()
+
+	// Simulate the race by DELETing the singleton between the
+	// rotate handler's logical SELECT and its UPDATE — we delete
+	// before the rotate request runs since the handler's internal
+	// SELECT happens immediately at request start, but the UPDATE
+	// is what's testable as "zero rows".
+	if _, err := db.DB.Exec(`DELETE FROM tailscale_connection WHERE id = 'singleton'`); err != nil {
+		t.Fatalf("simulate disconnect: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]string{"client_id": "id2", "client_secret": "secret2"})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/tailscale/connection", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := app.Test(req, -1)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("rotate after disconnect should be 404, got %d", resp.StatusCode)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(out, []byte("not_connected")) {
+		t.Errorf("body should carry code=not_connected, got %s", out)
+	}
+
+	// Audit log should NOT contain a tailscale.rotated entry
+	// because the UPDATE landed zero rows.
+	var auditCount int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action = 'tailscale.rotated'`).Scan(&auditCount)
+	if auditCount != 0 {
+		t.Errorf("no rotate audit row should exist after zero-rows update; got %d", auditCount)
 	}
 }

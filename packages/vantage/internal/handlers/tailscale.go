@@ -166,16 +166,6 @@ func connectTailscale(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "client_id, client_secret, and tailnet are required"})
 	}
 
-	var existing string
-	if err := db.DB.QueryRow(`SELECT id FROM tailscale_connection WHERE id = 'singleton'`).Scan(&existing); err == nil && existing != "" {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-			"error": "A Tailscale connection already exists. Use PUT /api/v1/tailscale/connection to rotate, or DELETE to disconnect first.",
-			"code":  409,
-		})
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		slog.Warn("tailscale: existence check failed", "error", err)
-	}
-
 	if err := runValidationChecks(c.UserContext(), req.ClientID, req.ClientSecret, req.Tailnet); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -191,14 +181,33 @@ func connectTailscale(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to encrypt credential"})
 	}
 
+	// Atomic singleton insert (codex round-3 finding #4). The pre-
+	// fix SELECT-then-INSERT pattern raced concurrent connects;
+	// the loser hit the PK constraint and returned 500. ON
+	// CONFLICT DO NOTHING + RowsAffected check gives a
+	// deterministic 409 for the loser.
 	now := time.Now().Unix()
 	userID, _ := c.Locals("user_id").(string)
-	if _, err := db.DB.Exec(
-		`INSERT INTO tailscale_connection (id, oauth_client_id_encrypted, oauth_client_secret_encrypted, tailnet, tailnet_display_name, connected_at, connected_by_user_id, last_validated_at) VALUES ('singleton', $1, $2, $3, $4, $5, $6, $7)`,
+	result, err := db.DB.Exec(
+		`INSERT INTO tailscale_connection (id, oauth_client_id_encrypted, oauth_client_secret_encrypted, tailnet, tailnet_display_name, connected_at, connected_by_user_id, last_validated_at)
+		     VALUES ('singleton', $1, $2, $3, $4, $5, $6, $7)
+		     ON CONFLICT (id) DO NOTHING`,
 		encID, encSecret, req.Tailnet, "", now, userID, now,
-	); err != nil {
+	)
+	if err != nil {
 		slog.Error("tailscale: persist", "error", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to persist connection"})
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		slog.Error("tailscale: rowsAffected", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to verify connection persisted"})
+	}
+	if rowsAffected == 0 {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "Tailscale already connected; use PUT /api/v1/tailscale/connection to rotate, or DELETE first.",
+			"code":  "already_connected",
+		})
 	}
 
 	events.AuditLog(userID, "tailscale.connected", "tailscale_connection", "singleton",
@@ -268,7 +277,10 @@ func rotateTailscaleConnection(c *fiber.Ctx) error {
 	var existingTailnet string
 	if err := db.DB.QueryRow(`SELECT tailnet FROM tailscale_connection WHERE id = 'singleton'`).Scan(&existingTailnet); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "No connection to rotate. Use POST /connect first."})
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Tailscale not currently connected; use POST /api/v1/tailscale/connect to establish credentials.",
+				"code":  "not_connected",
+			})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to read existing connection"})
 	}
@@ -315,13 +327,29 @@ func rotateTailscaleConnection(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to encrypt new credential"})
 	}
 
+	// RowsAffected check (codex round-3 finding #5). Without it, a
+	// concurrent disconnect between our SELECT above and this
+	// UPDATE silently lands zero rows but we'd report success and
+	// emit a misleading "rotated" audit row.
 	now := time.Now().Unix()
-	if _, err := db.DB.Exec(
+	result, err := db.DB.Exec(
 		`UPDATE tailscale_connection SET oauth_client_id_encrypted = $1, oauth_client_secret_encrypted = $2, rotated_at = $3, last_validated_at = $4, last_validation_error = NULL WHERE id = 'singleton'`,
 		encID, encSecret, now, now,
-	); err != nil {
+	)
+	if err != nil {
 		slog.Error("tailscale: rotate UPDATE", "error", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to swap credential"})
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		slog.Error("tailscale: rotate rowsAffected", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to verify rotation"})
+	}
+	if rowsAffected == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Tailscale not currently connected; use POST /api/v1/tailscale/connect to establish credentials.",
+			"code":  "not_connected",
+		})
 	}
 
 	userID, _ := c.Locals("user_id").(string)
