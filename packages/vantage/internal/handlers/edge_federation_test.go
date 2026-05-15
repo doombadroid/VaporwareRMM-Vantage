@@ -721,3 +721,94 @@ func TestEdgeRegister_RateLimitScopedPerToken(t *testing.T) {
 		}
 	}
 }
+
+// audit_chain_head validation (codex finding #2). Persisting an
+// empty signature would silently degrade the tamper-evidence
+// contract from #22 Q9. Handlers must reject before any DB write.
+
+func TestPoll_MissingSignature(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-poll-nosig", "tenant-1", 25*24*time.Hour)
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq": int64(1),
+			// signature omitted
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("missing signature should be 400, got %d", resp.StatusCode)
+	}
+	var checkpointCount int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_checkpoints WHERE counterparty_id = 'edge-poll-nosig'`).Scan(&checkpointCount)
+	if checkpointCount != 0 {
+		t.Errorf("no checkpoint should have been written on rejected request, got %d", checkpointCount)
+	}
+}
+
+func TestPoll_EmptySignature(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-poll-emptysig", "tenant-1", 25*24*time.Hour)
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("empty signature should be 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestPoll_ZeroSeq(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-poll-zeroseq", "tenant-1", 25*24*time.Hour)
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(0),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("seq=0 should be 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestPoll_NegativeSeq(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-poll-negseq", "tenant-1", 25*24*time.Hour)
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(-5),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("seq<0 should be 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestEvents_MissingSignature(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-evt-nosig", "tenant-1", 25*24*time.Hour)
+	resp := postEdgeEventsHTTP(t, app, plain, map[string]interface{}{
+		"events": []map[string]interface{}{
+			{"correlation_id": "c1", "type": "heartbeat", "occurred_at": time.Now().Unix()},
+		},
+		"audit_chain_head": map[string]interface{}{
+			"seq": int64(1),
+			// signature omitted
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("events with missing signature should be 400, got %d", resp.StatusCode)
+	}
+}

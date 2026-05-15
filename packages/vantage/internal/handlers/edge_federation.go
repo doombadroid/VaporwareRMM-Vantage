@@ -146,6 +146,9 @@ func postEdgeEvents(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("batch size %d exceeds max %d", len(req.Events), maxEventsPerBatch),
 		})
 	}
+	if auditChainHeadInvalid(c, req.AuditChainHead.Seq, req.AuditChainHead.Signature) {
+		return nil
+	}
 
 	edgeID, _ := c.Locals("edge_id").(string)
 
@@ -220,6 +223,9 @@ func pollEdge(c *fiber.Ctx) error {
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+	}
+	if auditChainHeadInvalid(c, req.AuditChainHead.Seq, req.AuditChainHead.Signature) {
+		return nil
 	}
 
 	edgeID, _ := c.Locals("edge_id").(string)
@@ -496,6 +502,38 @@ func registerEdge(c *fiber.Ctx) error {
 		"token_expires_at":      tokenExpiresAt,
 		"poll_interval_seconds": defaultPollIntervalSeconds,
 	})
+}
+
+// auditChainHeadInvalid writes a 400 response describing what's
+// wrong with audit_chain_head, and reports back whether it wrote
+// anything. Callers pattern: `if invalid := auditChainHeadInvalid(c, seq, sig); invalid { return nil }`.
+//
+// Codex finding #2 caught that the poll/events handlers were
+// persisting empty signatures silently — defeats the tamper-
+// evidence contract (#22 Q9).
+//
+// Returning a bool (rather than an error) sidesteps Fiber's
+// convention where a non-nil return from a handler triggers the
+// framework error handler and clobbers our JSON. c.Status(...)
+// .JSON(...) returns the error from JSON encoding (nil on
+// success), so a callsite checking `if err := validate(...); err != nil`
+// silently fell through under that earlier pattern.
+func auditChainHeadInvalid(c *fiber.Ctx, seq int64, signature string) bool {
+	if signature == "" {
+		_ = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "audit_chain_head.signature is required",
+			"code":  "missing_audit_chain_signature",
+		})
+		return true
+	}
+	if seq <= 0 {
+		_ = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "audit_chain_head.seq must be positive",
+			"code":  "invalid_audit_chain_seq",
+		})
+		return true
+	}
+	return false
 }
 
 // generateEdgeToken returns a fresh `vet_<43-char base64>` string.
