@@ -336,23 +336,38 @@ func ClearSessionCookies(c *fiber.Ctx) {
 func IsSuperAdmin(role string) bool { return role == "super_admin" }
 
 // EdgeAuthMiddleware validates federation Bearer tokens for the
-// /api/edge/poll and /api/edge/events endpoints. Issue #22 Q2 +
-// Q10 specify:
+// /api/edge/poll and /api/edge/events endpoints.
 //
-//   - Bearer token + tailnet identity defense in depth: every
-//     request validates the token hash hits the edges table AND
-//     that the source IP matches the tailnet_ip recorded at
-//     registration.
+// Per the design lock in #22 Q2, this layer was originally going
+// to include a defense-in-depth check binding the Edge token to
+// the source tailnet_ip recorded at registration. Codex review on
+// PR #1 surfaced (correctly) that application-layer access to the
+// real tailnet source IP is not reliable: when Vantage runs behind
+// a reverse proxy (Caddy in production), c.IP() resolves to the
+// proxy or to whatever X-Forwarded-For carries, not the original
+// tailnet IP. Even direct-attached, the IP isn't a strong identity
+// binding — addresses can change, be spoofed in some topologies,
+// etc.
 //
-//   - No in-memory cache. Every request hits Postgres. Q10 forbids
-//     process-local state for cross-request mutable data. If
-//     polling throughput becomes a problem later (~700 lookups/sec
-//     at 10K Edges × 15s polls), the optimization is a Redis cache
-//     with PUB/SUB invalidation; not in F2.
+// The IP check was removed in F2 review (commit history). The
+// active defense surface in F2 is:
 //
-// Context locals set on success: edge_id, tenant_id,
-// tailnet_identity. Downstream handlers read these instead of
-// re-querying the edges table.
+//   - Tailscale network identity: only tailnet members can reach
+//     Vantage's tailnet endpoint at all (network-layer ACL).
+//
+//   - Per-Edge Bearer token: SHA-256 hashed at rest, 30-day TTL
+//     with poll-time rotation, application-layer cryptographic
+//     identity per Edge.
+//
+// Future hardening (out of scope for F2): mTLS using Tailscale-
+// issued node certificates, or a Tailscale-aware sidecar that
+// surfaces verified peer identity into a request header Vantage
+// can trust. Track follow-up against #22.
+//
+// Q10 still applies: no in-memory cache. Every request hits
+// Postgres for the token-hash lookup. Redis cache with PUB/SUB
+// invalidation is the optimization path if poll throughput at
+// scale requires it.
 func EdgeAuthMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		authHeader := c.Get("Authorization")
@@ -373,15 +388,14 @@ func EdgeAuthMiddleware() fiber.Handler {
 			edgeID          string
 			tenantID        string
 			tailnetIdentity sql.NullString
-			tailnetIP       sql.NullString
 			tokenExpiresAt  sql.NullInt64
 		)
 		err := db.DB.QueryRow(
-			`SELECT id, tenant_id, tailnet_identity, tailnet_ip, token_expires_at
+			`SELECT id, tenant_id, tailnet_identity, token_expires_at
 			   FROM edges
 			   WHERE token_hash = $1 AND status = 'active'`,
 			tokenHash,
-		).Scan(&edgeID, &tenantID, &tailnetIdentity, &tailnetIP, &tokenExpiresAt)
+		).Scan(&edgeID, &tenantID, &tailnetIdentity, &tokenExpiresAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unknown or inactive edge token", "code": 401})
 		}
@@ -392,26 +406,6 @@ func EdgeAuthMiddleware() fiber.Handler {
 
 		if tokenExpiresAt.Valid && tokenExpiresAt.Int64 < time.Now().Unix() {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "edge token expired", "code": 401})
-		}
-
-		// Defense in depth: source IP must match the tailnet_ip
-		// recorded at registration. If no IP was recorded, skip
-		// the check (Edges that don't report their tailnet IP — F3
-		// may not have the column populated until first poll — fall
-		// through to plain bearer-token auth).
-		if tailnetIP.Valid && tailnetIP.String != "" {
-			requestIP := c.IP()
-			if requestIP != tailnetIP.String {
-				slog.Warn("edge auth: source IP mismatch",
-					"edge_id", edgeID,
-					"expected_ip", tailnetIP.String,
-					"actual_ip", requestIP,
-				)
-				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-					"error": "source IP does not match recorded tailnet identity",
-					"code":  401,
-				})
-			}
 		}
 
 		// Heartbeat. Update last_seen_at on every successful auth.

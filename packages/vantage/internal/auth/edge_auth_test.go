@@ -163,24 +163,19 @@ func TestEdgeAuthMiddleware_ExpiredToken(t *testing.T) {
 	}
 }
 
-func TestEdgeAuthMiddleware_IPMismatch(t *testing.T) {
+// TestEdgeAuthMiddleware_AcceptsAnyClientIP: codex review removed
+// the source-IP binding from EdgeAuthMiddleware (it couldn't be
+// implemented reliably behind a reverse proxy). The middleware now
+// authenticates by Bearer token alone — a valid token from any
+// client address must succeed. tailnet_ip stays in the edges
+// schema for operator visibility but is load-bearing in nothing.
+func TestEdgeAuthMiddleware_AcceptsAnyClientIP(t *testing.T) {
 	app := edgeAuthEnv(t)
-	// Seed with a tailnet_ip the test request will NOT use.
-	plain := seedEdge(t, "edge-ip-fenced", "tenant-x", "100.99.99.99", "active", time.Hour)
-	resp, _ := app.Test(authedRequest(plain), -1)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("IP mismatch should hit 401, got %d", resp.StatusCode)
-	}
-}
-
-func TestEdgeAuthMiddleware_IPCheckSkippedWhenEmpty(t *testing.T) {
-	app := edgeAuthEnv(t)
-	// tailnet_ip empty → skip the source-IP check.
-	plain := seedEdge(t, "edge-flex", "tenant-x", "", "active", time.Hour)
+	// Seed with a tailnet_ip the test request can't possibly use.
+	plain := seedEdge(t, "edge-any-ip", "tenant-x", "100.99.99.99", "active", time.Hour)
 	resp, _ := app.Test(authedRequest(plain), -1)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("empty tailnet_ip should skip IP check, got %d", resp.StatusCode)
+		t.Errorf("valid token should auth regardless of source IP; got %d", resp.StatusCode)
 	}
 }
