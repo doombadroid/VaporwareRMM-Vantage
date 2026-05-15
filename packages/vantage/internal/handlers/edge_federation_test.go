@@ -940,3 +940,34 @@ func TestMaybeRotateToken_StaleHashReturnsErr(t *testing.T) {
 		t.Errorf("expected ErrTokenHashMismatch on stale presented hash, got %v", err)
 	}
 }
+
+// TestEdgePoll_ChainReadFailure: codex round-3 finding #2. When
+// the audit_log table is unavailable (simulated by dropping it),
+// LatestChainHead errors and the poll handler must return 500
+// chain_read_failed rather than emit a fake genesis-shaped head.
+func TestEdgePoll_ChainReadFailure(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-chainfail", "tenant-1", 25*24*time.Hour)
+
+	// Drop the audit_log table so LatestChainHead errors with
+	// "relation does not exist".
+	if _, err := db.DB.Exec(`DROP TABLE audit_log CASCADE`); err != nil {
+		t.Fatalf("drop audit_log: %v", err)
+	}
+
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("chain read failure should be 500, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("chain_read_failed")) {
+		t.Errorf("body should carry code=chain_read_failed, got %s", body)
+	}
+}

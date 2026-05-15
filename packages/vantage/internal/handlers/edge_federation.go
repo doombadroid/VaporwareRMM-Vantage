@@ -290,7 +290,18 @@ func pollEdge(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotation check failed"})
 	}
 
-	vantageSeq, vantageSig, _ := events.LatestChainHead()
+	vantageSeq, vantageSig, err := events.LatestChainHead()
+	if err != nil {
+		// Codex round-3 finding #2: chain state is load-bearing
+		// for cross-attestation. A genesis-shaped (0/"") response
+		// would silently degrade the tamper-evidence contract
+		// from #22 Q9. Fail loudly.
+		slog.Error("poll: read vantage chain head", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to read chain state",
+			"code":  "chain_read_failed",
+		})
+	}
 
 	resp := fiber.Map{
 		"vantage_version": "0.1.0",
