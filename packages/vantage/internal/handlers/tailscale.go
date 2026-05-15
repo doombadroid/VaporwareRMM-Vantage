@@ -327,14 +327,19 @@ func rotateTailscaleConnection(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to encrypt new credential"})
 	}
 
-	// RowsAffected check (codex round-3 finding #5). Without it, a
-	// concurrent disconnect between our SELECT above and this
-	// UPDATE silently lands zero rows but we'd report success and
-	// emit a misleading "rotated" audit row.
+	// Compare-and-set on tailnet (codex round-6 #4). The existing
+	// tailnet was read into existingTailnet earlier in this
+	// handler; include it as a WHERE predicate so a concurrent
+	// disconnect+reconnect to a DIFFERENT tailnet can't have us
+	// rotating credentials onto a row whose semantics changed
+	// since our pre-check. Distinguish "no singleton" from
+	// "singleton has different tailnet now" via a follow-up SELECT.
 	now := time.Now().Unix()
 	result, err := db.DB.Exec(
-		`UPDATE tailscale_connection SET oauth_client_id_encrypted = $1, oauth_client_secret_encrypted = $2, rotated_at = $3, last_validated_at = $4, last_validation_error = NULL WHERE id = 'singleton'`,
-		encID, encSecret, now, now,
+		`UPDATE tailscale_connection
+		     SET oauth_client_id_encrypted = $1, oauth_client_secret_encrypted = $2, rotated_at = $3, last_validated_at = $4, last_validation_error = NULL
+		     WHERE id = 'singleton' AND tailnet = $5`,
+		encID, encSecret, now, now, existingTailnet,
 	)
 	if err != nil {
 		slog.Error("tailscale: rotate UPDATE", "error", err)
@@ -346,9 +351,23 @@ func rotateTailscaleConnection(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to verify rotation"})
 	}
 	if rowsAffected == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error": "Tailscale not currently connected; use POST /api/v1/tailscale/connect to establish credentials.",
-			"code":  "not_connected",
+		var currentTailnet sql.NullString
+		diagErr := db.DB.QueryRow(`SELECT tailnet FROM tailscale_connection WHERE id = 'singleton'`).Scan(&currentTailnet)
+		if errors.Is(diagErr, sql.ErrNoRows) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Tailscale not currently connected; use POST /api/v1/tailscale/connect to establish credentials.",
+				"code":  "not_connected",
+			})
+		}
+		if diagErr != nil {
+			slog.Error("tailscale: rotate diagnose", "error", diagErr)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotate diagnose failed"})
+		}
+		// Singleton still exists but tailnet drifted.
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error":           "Tailscale connection changed concurrently; refresh and retry rotation",
+			"code":            "tailnet_changed_concurrently",
+			"current_tailnet": currentTailnet.String,
 		})
 	}
 

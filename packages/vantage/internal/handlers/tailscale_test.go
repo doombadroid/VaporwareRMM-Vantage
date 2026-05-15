@@ -431,3 +431,81 @@ func TestRotateTailscaleConnection_RaceWithDisconnect(t *testing.T) {
 		t.Errorf("no rotate audit row should exist after zero-rows update; got %d", auditCount)
 	}
 }
+
+// TestRotateTailscale_ConcurrentTailnetChange: codex round-6 #4.
+// Drives the CAS path deterministically: fake's Authenticate hook
+// flips the row's tailnet between the handler's SELECT and its
+// UPDATE. The UPDATE's WHERE clause includes the previously-read
+// tailnet, so it lands zero rows; diagnose-select returns the
+// drifted value; response is 409 tailnet_changed_concurrently.
+func TestRotateTailscale_ConcurrentTailnetChange(t *testing.T) {
+	app, swap := tailscaleTestEnv(t, "super_admin")
+	swap(&fakeTSClient{})
+	postJSON(t, app, "/api/v1/tailscale/connect", map[string]string{
+		"client_id": "id-acme", "client_secret": "secret-acme", "tailnet": "acme.ts.net",
+	}).Body.Close()
+
+	swap(&fakeTSClient{
+		authenticate: func(ctx context.Context) error {
+			// Handler's Authenticate call sits AFTER its
+			// existingTailnet SELECT and BEFORE its UPDATE.
+			// Flip the row's tailnet here to simulate a
+			// concurrent disconnect+reconnect race.
+			if _, err := db.DB.Exec(
+				`UPDATE tailscale_connection SET tailnet = 'drifted.ts.net' WHERE id = 'singleton'`,
+			); err != nil {
+				t.Fatalf("simulate concurrent change inside Authenticate: %v", err)
+			}
+			return nil
+		},
+		listTailnets: func(ctx context.Context) ([]tailscale.Tailnet, error) {
+			// Validation matches existingTailnet ("acme.ts.net"
+			// — read before our flip) against this list. Return
+			// acme so validation passes and the rotate reaches
+			// the UPDATE.
+			return []tailscale.Tailnet{{Name: "acme.ts.net"}}, nil
+		},
+	})
+
+	body, _ := json.Marshal(map[string]string{"client_id": "id2", "client_secret": "secret2"})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/tailscale/connection", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := app.Test(req, -1)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		out, _ := io.ReadAll(resp.Body)
+		t.Errorf("expected 409 on tailnet change, got %d body=%s", resp.StatusCode, out)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(out, []byte("tailnet_changed_concurrently")) {
+		t.Errorf("body should carry code=tailnet_changed_concurrently, got %s", out)
+	}
+
+	// Audit log must not record a "rotated" event for the failed
+	// rotation.
+	var auditCount int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action = 'tailscale.rotated'`).Scan(&auditCount)
+	if auditCount != 0 {
+		t.Errorf("failed rotate must not emit audit row; got %d", auditCount)
+	}
+}
+
+// TestRotateTailscale_HappyPathStillWorks: confirm the new CAS
+// predicate doesn't break the normal rotation flow.
+func TestRotateTailscale_HappyPathStillWorks(t *testing.T) {
+	app, swap := tailscaleTestEnv(t, "super_admin")
+	swap(&fakeTSClient{})
+	postJSON(t, app, "/api/v1/tailscale/connect", map[string]string{
+		"client_id": "id1", "client_secret": "secret1", "tailnet": "acme.ts.net",
+	}).Body.Close()
+
+	body, _ := json.Marshal(map[string]string{"client_id": "id2", "client_secret": "secret2"})
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/tailscale/connection", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, _ := app.Test(req, -1)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		out, _ := io.ReadAll(resp.Body)
+		t.Errorf("happy-path rotate should be 200, got %d body=%s", resp.StatusCode, out)
+	}
+}
