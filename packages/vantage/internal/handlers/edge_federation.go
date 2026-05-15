@@ -173,12 +173,22 @@ func postEdgeEvents(c *fiber.Ctx) error {
 //   - Refuses (426) if edge_version drops below the configured
 //     MINIMUM_REQUIRED_EDGE_VERSION.
 //   - Rotates the Edge bearer token if it's within the rotation
-//     window (7 days). New plaintext returned in the response;
-//     old token continues to work until expiry so the Edge has
-//     a chance to persist the rotation before its current request
-//     loop ends.
+//     window (7 days). The rotation is ATOMIC: the UPDATE
+//     overwrites token_hash in one statement, so the old token is
+//     invalidated server-side the instant the response is built.
 //   - Returns commands=[] for F2 (the command pipeline lands in
 //     F4). Shape is locked so F4 just populates the slice.
+//
+// Atomic rotation contract (F3 implementer note):
+//   When the response carries new_edge_token, the old token is
+//   already dead. The Edge MUST persist the new token (atomic
+//   write — e.g., write to token.new, fsync, rename to token)
+//   before issuing any subsequent request. If the persist fails
+//   or the response is lost mid-flight, the Edge will see 401 on
+//   the next request and must fall back to re-enrollment via the
+//   operator-issued bundle. No grace window — the simpler
+//   contract closes a race where an attacker who captured the
+//   old token could use it during a rotation overlap.
 func pollEdge(c *fiber.Ctx) error {
 	var req struct {
 		EdgeVersion     string `json:"edge_version"`

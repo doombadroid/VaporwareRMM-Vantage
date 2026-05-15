@@ -608,3 +608,58 @@ func TestEdgeRegister_ConcurrentConsumptionRace(t *testing.T) {
 		t.Error("consumed_at should be set exactly once after the race")
 	}
 }
+
+// TestEdgePoll_TokenRotation_OldTokenImmediatelyInvalid locks the
+// atomic-rotation contract: after the rotation poll, the prior
+// plaintext is dead server-side immediately. No grace window.
+// F3's Edge-side implementation MUST atomically persist the new
+// token before issuing any subsequent request.
+func TestEdgePoll_TokenRotation_OldTokenImmediatelyInvalid(t *testing.T) {
+	app := edgeFederationEnv(t)
+	plain := seedEdgeForPoll(t, "edge-rot-atomic", "tenant-1", 3*24*time.Hour)
+
+	resp := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(1),
+			"signature": "sig",
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotation poll status %d", resp.StatusCode)
+	}
+	var out struct {
+		NewEdgeToken string `json:"new_edge_token"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.NewEdgeToken == "" {
+		t.Fatal("expected rotation; no new_edge_token in response")
+	}
+
+	// Old token must be dead immediately.
+	resp2 := postEdgePoll(t, app, plain, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(2),
+			"signature": "sig",
+		},
+	})
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Errorf("old token after rotation must be 401 immediately; got %d", resp2.StatusCode)
+	}
+
+	// New token works.
+	resp3 := postEdgePoll(t, app, out.NewEdgeToken, map[string]interface{}{
+		"edge_version": "0.1.0",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(3),
+			"signature": "sig",
+		},
+	})
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Errorf("new token should succeed, got %d", resp3.StatusCode)
+	}
+}
