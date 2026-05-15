@@ -2,83 +2,46 @@ package handlers
 
 import (
 	"errors"
-	"strconv"
 	"strings"
+
+	"golang.org/x/mod/semver"
 )
 
-// versionAtLeast reports whether candidate >= minimum, comparing
-// dotted-integer components left to right. Supports "X.Y.Z" with
-// an optional "-prerelease" suffix that's compared lexicographically
-// after the numeric components match.
+// versionAtLeast reports whether candidate >= minimum using
+// golang.org/x/mod/semver — which implements SemVer 2.0.0
+// comparison rules. Prerelease identifiers compare numerically
+// when numeric ("rc.10" > "rc.2"), lexically otherwise, and any
+// prerelease is less than its base version ("1.0.0-rc.1" <
+// "1.0.0").
 //
-// Imported semver libraries would be over-spec for what F2 needs:
-// the federation handshake carries plain "0.1.0"-style strings, no
-// build metadata, no module-path "v" prefixes.
+// Codex finding #5 flagged the hand-rolled comparison that
+// treated prerelease tags as raw strings — under that scheme
+// "rc.10" sorted before "rc.2".
 //
-// Errors: malformed candidate ("not a version") returns false +
-// error so the handler can surface a precise 400 instead of a
-// silent comparison.
+// x/mod/semver requires a "v" prefix on the input strings. We
+// add one if missing so the federation wire format ("0.1.0",
+// "1.0.0-rc.1") works directly.
 func versionAtLeast(candidate, minimum string) (bool, error) {
 	if minimum == "" {
-		// No floor configured — every Edge passes.
 		return true, nil
 	}
 	if candidate == "" {
 		return false, errors.New("missing version")
 	}
-	cMain, cPre := splitPre(candidate)
-	mMain, mPre := splitPre(minimum)
-	cParts, err := parseNums(cMain)
-	if err != nil {
-		return false, err
+	c := ensureV(candidate)
+	m := ensureV(minimum)
+	if !semver.IsValid(c) {
+		return false, errors.New("invalid version: " + candidate)
 	}
-	mParts, err := parseNums(mMain)
-	if err != nil {
-		return false, err
+	if !semver.IsValid(m) {
+		return false, errors.New("invalid minimum: " + minimum)
 	}
-	for i := 0; i < len(cParts) || i < len(mParts); i++ {
-		var a, b int
-		if i < len(cParts) {
-			a = cParts[i]
-		}
-		if i < len(mParts) {
-			b = mParts[i]
-		}
-		if a < b {
-			return false, nil
-		}
-		if a > b {
-			return true, nil
-		}
-	}
-	// Numeric parts equal. Pre-release ordering: absent > present
-	// (1.0.0 > 1.0.0-rc1), and within-pre-release lexicographic
-	// comparison.
-	if cPre == "" && mPre != "" {
-		return true, nil
-	}
-	if cPre != "" && mPre == "" {
-		return false, nil
-	}
-	return cPre >= mPre, nil
+	return semver.Compare(c, m) >= 0, nil
 }
 
-func splitPre(v string) (main, pre string) {
-	if i := strings.Index(v, "-"); i >= 0 {
-		return v[:i], v[i+1:]
+func ensureV(s string) string {
+	if !strings.HasPrefix(s, "v") {
+		return "v" + s
 	}
-	return v, ""
-}
-
-func parseNums(v string) ([]int, error) {
-	parts := strings.Split(v, ".")
-	out := make([]int, len(parts))
-	for i, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			return nil, errors.New("version component not numeric: " + p)
-		}
-		out[i] = n
-	}
-	return out, nil
+	return s
 }
