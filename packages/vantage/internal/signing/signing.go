@@ -39,36 +39,24 @@ var (
 )
 
 // Bootstrap loads the existing signing keypair or generates one
-// if the table is empty. Idempotent: re-running on a populated row
-// reuses the persisted key.
+// if the table is empty. Idempotent + concurrency-safe — multiple
+// Vantage nodes starting in parallel each propose their own
+// candidate keypair; ON CONFLICT DO NOTHING lets the database pick
+// one winner; every node then SELECTs the winning row.
+//
+// Per #22 Q10: cross-process state lives in Postgres, never in
+// per-node memory. A multi-node startup race in the original
+// (SELECT then INSERT) code caused all-but-one nodes to crash on
+// PK violation. Codex finding #5 flagged this.
 func Bootstrap() error {
-	var encPriv, pubPEM string
-	err := db.DB.QueryRow(
-		`SELECT private_key_encrypted, public_key FROM vantage_signing_key WHERE id = 'singleton'`,
-	).Scan(&encPriv, &pubPEM)
-	switch {
-	case err == nil:
-		priv, err := loadPrivate(encPriv)
-		if err != nil {
-			return fmt.Errorf("signing: load existing key: %w", err)
-		}
-		mu.Lock()
-		privateKey = priv
-		publicPEM = pubPEM
-		mu.Unlock()
-		slog.Info("signing: loaded existing Ed25519 keypair")
-		return nil
-	case errors.Is(err, sql.ErrNoRows):
-		// fall through to generation
-	default:
-		return fmt.Errorf("signing: read keypair row: %w", err)
-	}
-
+	// Generate a candidate keypair. If another node beats us to
+	// the INSERT, this candidate is silently discarded — Ed25519
+	// generation is cheap (<1ms), so the race-lost work is
+	// negligible.
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return fmt.Errorf("signing: generate ed25519: %w", err)
 	}
-
 	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
 		return fmt.Errorf("signing: marshal pkcs8: %w", err)
@@ -77,27 +65,51 @@ func Bootstrap() error {
 	if err != nil {
 		return fmt.Errorf("signing: marshal pkix: %w", err)
 	}
-	privPEMBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
-	pubPEMBytes := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
-
-	encryptedPriv, err := crypto.Encrypt(string(privPEMBytes))
+	candidatePrivPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
+	candidatePubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
+	encryptedCandidatePriv, err := crypto.Encrypt(string(candidatePrivPEM))
 	if err != nil {
-		return fmt.Errorf("signing: encrypt private key: %w", err)
+		return fmt.Errorf("signing: encrypt candidate private key: %w", err)
 	}
 
+	// ON CONFLICT DO NOTHING: if the row already exists, this is a
+	// no-op. The follow-up SELECT then loads the winning keypair —
+	// which may be the one we just inserted, or one inserted by
+	// another node, or one persisted on a prior boot.
 	if _, err := db.DB.Exec(
 		`INSERT INTO vantage_signing_key (id, private_key_encrypted, public_key, algorithm, created_at)
-		     VALUES ('singleton', $1, $2, 'Ed25519', $3)`,
-		encryptedPriv, string(pubPEMBytes), time.Now().Unix(),
+		     VALUES ('singleton', $1, $2, 'Ed25519', $3)
+		     ON CONFLICT (id) DO NOTHING`,
+		encryptedCandidatePriv, string(candidatePubPEM), time.Now().Unix(),
 	); err != nil {
-		return fmt.Errorf("signing: insert keypair: %w", err)
+		return fmt.Errorf("signing: insert candidate keypair: %w", err)
+	}
+
+	var pubPEM, encPriv string
+	if err := db.DB.QueryRow(
+		`SELECT public_key, private_key_encrypted FROM vantage_signing_key WHERE id = 'singleton'`,
+	).Scan(&pubPEM, &encPriv); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("signing: vantage_signing_key row missing after upsert")
+		}
+		return fmt.Errorf("signing: read keypair row: %w", err)
+	}
+
+	loadedPriv, err := loadPrivate(encPriv)
+	if err != nil {
+		return fmt.Errorf("signing: load winning keypair: %w", err)
 	}
 
 	mu.Lock()
-	privateKey = priv
-	publicPEM = string(pubPEMBytes)
+	privateKey = loadedPriv
+	publicPEM = pubPEM
 	mu.Unlock()
-	slog.Info("signing: generated new Ed25519 keypair")
+
+	if pubPEM == string(candidatePubPEM) {
+		slog.Info("signing: generated new Ed25519 keypair")
+	} else {
+		slog.Info("signing: loaded existing Ed25519 keypair (race-lost or prior boot)")
+	}
 	return nil
 }
 
