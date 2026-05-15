@@ -88,6 +88,23 @@ func Init() error {
 		)
 	}
 	JWTSecret = []byte(sec)
+
+	// Cookie-secure sanity check: refuse to boot when the deployment
+	// looks production-like (VANTAGE_PUBLIC_URL is https) but the
+	// operator has set FORCE_SECURE_COOKIES=false. That combination
+	// is almost always a misconfiguration — a dev opt-out leaking
+	// into a production env file.
+	if os.Getenv("FORCE_SECURE_COOKIES") == "false" {
+		publicURL := strings.ToLower(os.Getenv("VANTAGE_PUBLIC_URL"))
+		if strings.HasPrefix(publicURL, "https://") {
+			return errors.New(
+				"refusing to boot: FORCE_SECURE_COOKIES=false but VANTAGE_PUBLIC_URL starts with https:// — " +
+					"the combination would issue non-Secure auth cookies to a TLS deployment. " +
+					"Unset FORCE_SECURE_COOKIES (defaults to true) for production, or set VANTAGE_PUBLIC_URL " +
+					"to an http:// URL if this really is local development",
+			)
+		}
+	}
 	return nil
 }
 
@@ -289,13 +306,34 @@ func CSRFMiddleware() fiber.Handler {
 	}
 }
 
+// cookieSecure decides whether the Set-Cookie response carries
+// the Secure flag.
+//
+// The original implementation derived the flag from c.Protocol()
+// ("https"). Codex review on PR #1 flagged the bug: when Vantage
+// runs behind a TLS-terminating proxy (Caddy in our standard
+// deployment), the backend connection is plain HTTP — c.Protocol()
+// returns "http", Secure is unset, and browsers will send the
+// auth cookie over plain HTTP to any same-origin URL.
+//
+// New rule: cookies are always Secure unless the operator
+// explicitly opts out via FORCE_SECURE_COOKIES=false. Default
+// secure means a misconfigured dev environment fails noisy
+// (cookie won't stick over http://localhost without the opt-out)
+// rather than a misconfigured production environment failing
+// silent (cookies fly cleartext).
+//
+// The startup sanity check in main.go refuses to boot when
+// PUBLIC_URL is https and FORCE_SECURE_COOKIES is false — that
+// combination is almost always an operator mistake.
+func cookieSecure() bool {
+	return os.Getenv("FORCE_SECURE_COOKIES") != "false"
+}
+
 // SetSessionCookies writes the auth_token (httpOnly) and csrf_token
-// (JS-readable) cookies on a successful login. Secure=true is set
-// based on the request scheme — operators running Vantage behind
-// Caddy with TLS get Secure cookies; local dev over HTTP doesn't
-// (otherwise the cookie wouldn't stick).
+// (JS-readable) cookies on a successful login.
 func SetSessionCookies(c *fiber.Ctx, jwtPlain, csrfVal string) {
-	secure := c.Protocol() == "https"
+	secure := cookieSecure()
 	c.Cookie(&fiber.Cookie{
 		Name:     authCookie,
 		Value:    jwtPlain,
@@ -318,12 +356,13 @@ func SetSessionCookies(c *fiber.Ctx, jwtPlain, csrfVal string) {
 
 // ClearSessionCookies wipes both cookies on logout.
 func ClearSessionCookies(c *fiber.Ctx) {
+	secure := cookieSecure()
 	for _, name := range []string{authCookie, csrfCookie} {
 		c.Cookie(&fiber.Cookie{
 			Name:     name,
 			Value:    "",
 			HTTPOnly: name == authCookie,
-			Secure:   c.Protocol() == "https",
+			Secure:   secure,
 			SameSite: "Strict",
 			Path:     "/",
 			MaxAge:   -1,

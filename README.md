@@ -60,6 +60,9 @@ Open `http://localhost` in a browser, log in as `admin@vaporrmm-vantage.local` w
 | `ACME_EMAIL` | no | Let's Encrypt contact. Required if `DOMAIN` is a real public name. |
 | `BIND_ADDR` | no | Caddy publishes on this address. Default `127.0.0.1` (Tailscale-only access); `0.0.0.0` for public. |
 | `VANTAGE_PORT` | no | Override the internal :9090 port. Useful only for non-compose deployments. |
+| `VANTAGE_PUBLIC_URL` | no | External URL operators paste into enrollment bundles. Used by the `FORCE_SECURE_COOKIES` sanity check. |
+| `FORCE_SECURE_COOKIES` | no | Default `true`. Set `false` only for local-dev iteration over `http://localhost`. Combination of `false` + `https://` `VANTAGE_PUBLIC_URL` is rejected at boot — that combination would leak auth cookies cleartext. |
+| `MINIMUM_REQUIRED_EDGE_VERSION` | no | Floor for federated Edge handshake. Empty = no floor. Must be a valid semver (e.g. `0.1.0` or `v0.1.0`) — invalid values are rejected at boot. |
 
 ## Quick start (dev, no Docker)
 
