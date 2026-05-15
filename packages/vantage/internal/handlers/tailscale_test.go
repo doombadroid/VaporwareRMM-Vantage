@@ -29,6 +29,7 @@ type fakeTSClient struct {
 	validateDeviceLst func(ctx context.Context, tn string) error
 	listDevices       func(ctx context.Context, tn string) ([]tailscale.Device, error)
 	mintEnrollment    func(ctx context.Context, tn, desc string) (*tailscale.AuthKey, error)
+	revokeAuthKey     func(ctx context.Context, tn, keyID string) error
 }
 
 func (f *fakeTSClient) Authenticate(ctx context.Context) error {
@@ -66,6 +67,12 @@ func (f *fakeTSClient) MintEdgeEnrollmentAuthKey(ctx context.Context, tn, desc s
 		return &tailscale.AuthKey{ID: "fake-key-id", Key: "tskey-auth-fake"}, nil
 	}
 	return f.mintEnrollment(ctx, tn, desc)
+}
+func (f *fakeTSClient) RevokeAuthKey(ctx context.Context, tn, keyID string) error {
+	if f.revokeAuthKey == nil {
+		return nil
+	}
+	return f.revokeAuthKey(ctx, tn, keyID)
 }
 
 const tailscaleTestEncryptionKey = "fmZn0pFd/f58gKeknlaECEbcMDh5oQ+nRhFB/sAMScY="

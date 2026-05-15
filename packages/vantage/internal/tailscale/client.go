@@ -456,6 +456,41 @@ func (c *Client) MintAuthKey(ctx context.Context, opts MintAuthKeyOptions) (*Aut
 	return &k, nil
 }
 
+// RevokeAuthKey deletes a previously-minted Tailscale auth key.
+// Used as a compensation step when Vantage minted a key and then
+// failed to persist the link to its own row — without this, the
+// key would dangle in Tailscale with no Vantage record of it.
+// Best-effort: callers log on error and move on, since the key
+// expires on its own per its TTL.
+func (c *Client) RevokeAuthKey(ctx context.Context, tailnet, keyID string) error {
+	if err := c.Authenticate(ctx); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+		c.baseURL+"/api/v2/tailnet/"+url.PathEscape(tailnet)+"/keys/"+url.PathEscape(keyID), nil)
+	if err != nil {
+		return err
+	}
+	c.applyAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrTailscaleUnreachable, err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
+		// 404 = already deleted; idempotent success.
+		return nil
+	case http.StatusUnauthorized:
+		return ErrTailscaleAuthFailed
+	case http.StatusTooManyRequests:
+		return rateLimitErrFromHeader(resp)
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("tailscale: revoke key HTTP %d: %s", resp.StatusCode, string(body))
+	}
+}
+
 func (c *Client) applyAuth(req *http.Request) {
 	c.tokenMu.Lock()
 	tok := c.token

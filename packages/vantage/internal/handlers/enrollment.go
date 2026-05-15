@@ -89,29 +89,57 @@ func mintEnrollmentToken(c *fiber.Ctx) error {
 	}
 	tokenHash := auth.HashToken(plaintext)
 
-	cl := tailscaleClientFactory(clientID, clientSecret)
-	authKey, err := cl.MintEdgeEnrollmentAuthKey(c.UserContext(), tailnet,
-		fmt.Sprintf("vantage enrollment for tenant %s", req.TenantID))
-	if err != nil {
-		slog.Error("enrollment: mint tailscale key", "error", err)
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
-			"error": classifyTailscaleError(err, "failed to mint Tailscale auth key"),
-		})
-	}
-
 	now := time.Now()
 	expiresAt := now.Add(enrollmentTokenTTL).Unix()
 	id := uuid.New().String()
 	userID, _ := c.Locals("user_id").(string)
 
+	// Insert enrollment_tokens row FIRST with NULL tailscale_auth_
+	// key_id. If we minted the Tailscale key first and then the
+	// INSERT failed, the key would dangle in Tailscale with no
+	// Vantage record of it (codex finding #4). Ordering INSERT
+	// before mint flips the failure mode: if mint fails, the
+	// orphaned row has no Tailscale key to leak — the operator
+	// sees a clear error and the row will simply expire per its TTL.
 	if _, err := db.DB.Exec(
 		`INSERT INTO enrollment_tokens
 		     (id, token_hash, tenant_id, tailscale_auth_key_id, created_at, expires_at, minted_by_user_id, notes)
-		     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		id, tokenHash, req.TenantID, authKey.ID, now.Unix(), expiresAt, userID, nullableString(req.Notes),
+		     VALUES ($1, $2, $3, NULL, $4, $5, $6, $7)`,
+		id, tokenHash, req.TenantID, now.Unix(), expiresAt, userID, nullableString(req.Notes),
 	); err != nil {
 		slog.Error("enrollment: insert row", "error", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to persist enrollment token"})
+	}
+
+	cl := tailscaleClientFactory(clientID, clientSecret)
+	authKey, err := cl.MintEdgeEnrollmentAuthKey(c.UserContext(), tailnet,
+		fmt.Sprintf("vantage enrollment for tenant %s", req.TenantID))
+	if err != nil {
+		slog.Error("enrollment: mint tailscale key", "error", err, "row_id", id)
+		// Row exists with NULL tailscale_auth_key_id. Operator
+		// gets the error and can either retry (which will hit
+		// token_hash UNIQUE) or manually clean up. The row
+		// expires naturally per its 24h TTL.
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+			"error":  classifyTailscaleError(err, "failed to mint Tailscale auth key"),
+			"row_id": id,
+		})
+	}
+
+	if _, err := db.DB.Exec(
+		`UPDATE enrollment_tokens SET tailscale_auth_key_id = $1 WHERE id = $2`,
+		authKey.ID, id,
+	); err != nil {
+		// Compensation: revoke the Tailscale key we just minted —
+		// without this it would dangle in Tailscale with the
+		// enrollment row pointing at NULL.
+		slog.Error("enrollment: link tailscale key id", "error", err, "key_id", authKey.ID)
+		if revokeErr := cl.RevokeAuthKey(c.UserContext(), tailnet, authKey.ID); revokeErr != nil {
+			slog.Error("enrollment: failed to revoke orphaned tailscale key",
+				"error", revokeErr, "key_id", authKey.ID,
+				"note", "key will expire per its 24h TTL")
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to link tailscale auth key"})
 	}
 
 	// Synchronous: operator should only see the bundle returned

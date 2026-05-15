@@ -148,3 +148,93 @@ func TestMintEnrollmentToken_RequiresSuperAdmin(t *testing.T) {
 		t.Errorf("non-super-admin should hit 403, got %d", resp.StatusCode)
 	}
 }
+
+// TestMintEnrollmentToken_TailscaleMintFails: the Tailscale mint
+// fails; the enrollment_tokens row should exist (it was INSERTed
+// before the mint attempt) but tailscale_auth_key_id stays NULL.
+// No orphaned Tailscale auth key. The operator gets a clear error
+// with the row_id for manual cleanup if desired.
+func TestMintEnrollmentToken_TailscaleMintFails(t *testing.T) {
+	app, swap := enrollmentEnv(t, "super_admin")
+
+	swap(&fakeTSClient{})
+	r := postJSON(t, app, "/api/v1/tailscale/connect", map[string]string{
+		"client_id": "id", "client_secret": "secret", "tailnet": "acme.ts.net",
+	})
+	r.Body.Close()
+
+	swap(&fakeTSClient{
+		mintEnrollment: func(ctx context.Context, tn, desc string) (*tailscale.AuthKey, error) {
+			return nil, tailscale.ErrTailscaleUnreachable
+		},
+	})
+
+	resp := postJSON(t, app, "/api/v1/vantage/enrollment-tokens", map[string]string{
+		"tenant_id": "tenant-mint-fail",
+		"notes":     "mint will fail",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502 when mint fails, got %d", resp.StatusCode)
+	}
+
+	// Row exists with NULL tailscale_auth_key_id.
+	var rowCount int
+	var keyIDNull bool
+	if err := db.DB.QueryRow(
+		`SELECT COUNT(*), bool_and(tailscale_auth_key_id IS NULL) FROM enrollment_tokens WHERE tenant_id = 'tenant-mint-fail'`,
+	).Scan(&rowCount, &keyIDNull); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 1 {
+		t.Errorf("expected enrollment row to exist after mint failure, got %d rows", rowCount)
+	}
+	if !keyIDNull {
+		t.Error("tailscale_auth_key_id should be NULL after mint failure")
+	}
+}
+
+// TestMintEnrollmentToken_LinkUpdateFailsRevokes: in the (rare)
+// case where the post-mint UPDATE fails, the handler must revoke
+// the just-minted Tailscale key so it doesn't dangle.
+func TestMintEnrollmentToken_LinkUpdateFailsRevokes(t *testing.T) {
+	app, swap := enrollmentEnv(t, "super_admin")
+
+	swap(&fakeTSClient{})
+	r := postJSON(t, app, "/api/v1/tailscale/connect", map[string]string{
+		"client_id": "id", "client_secret": "secret", "tailnet": "acme.ts.net",
+	})
+	r.Body.Close()
+
+	revoked := ""
+	swap(&fakeTSClient{
+		mintEnrollment: func(ctx context.Context, tn, desc string) (*tailscale.AuthKey, error) {
+			return &tailscale.AuthKey{ID: "k-orphan", Key: "tskey-orphan"}, nil
+		},
+		revokeAuthKey: func(ctx context.Context, tn, keyID string) error {
+			revoked = keyID
+			return nil
+		},
+	})
+
+	// Force the UPDATE to fail with a CHECK constraint that blocks
+	// the specific key_id the fake returns. INSERT writes NULL so
+	// passes the check; UPDATE setting it to k-orphan violates.
+	if _, err := db.DB.Exec(`ALTER TABLE enrollment_tokens ADD CONSTRAINT block_orphan CHECK (tailscale_auth_key_id IS DISTINCT FROM 'k-orphan')`); err != nil {
+		t.Fatalf("install check: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.DB.Exec(`ALTER TABLE enrollment_tokens DROP CONSTRAINT block_orphan`)
+	})
+
+	resp := postJSON(t, app, "/api/v1/vantage/enrollment-tokens", map[string]string{
+		"tenant_id": "tenant-link-fail",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500 when link UPDATE fails, got %d", resp.StatusCode)
+	}
+	if revoked != "k-orphan" {
+		t.Errorf("orphaned Tailscale key should have been revoked, got %q", revoked)
+	}
+}

@@ -49,6 +49,7 @@ type tailscaleAPI interface {
 	ValidateDeviceListScope(ctx context.Context, tailnet string) error
 	ListDevices(ctx context.Context, tailnet string) ([]tailscale.Device, error)
 	MintEdgeEnrollmentAuthKey(ctx context.Context, tailnet, description string) (*tailscale.AuthKey, error)
+	RevokeAuthKey(ctx context.Context, tailnet, keyID string) error
 }
 
 // RegisterTailscaleRoutes wires the Phase-1 endpoints under the
