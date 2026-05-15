@@ -40,6 +40,12 @@ services:
       REDIS_URL: redis://redis:6379
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       VANTAGE_PORT: "9090"
+      VANTAGE_PUBLIC_URL: ${VANTAGE_PUBLIC_URL:?VANTAGE_PUBLIC_URL is required (https://vantage.yourtailnet.ts.net)}
+      # Caddy is co-located in this compose. Trust its loopback
+      # addresses so X-Forwarded-For carries the real client IP
+      # for rate limiting and audit. Operators with a non-colocated
+      # proxy override via .env.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128}
     depends_on:
       postgres:
         condition: service_healthy
