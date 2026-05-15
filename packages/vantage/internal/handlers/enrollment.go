@@ -142,12 +142,22 @@ func mintEnrollmentToken(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to link tailscale auth key"})
 	}
 
-	// Synchronous: operator should only see the bundle returned
-	// after the audit row is durable. A fire-and-forget here would
-	// let a server crash between INSERT and audit lose the trace of
-	// who minted what.
-	events.AuditLogSync(userID, "enrollment_token.mint", "enrollment_token", id,
-		fmt.Sprintf("minted enrollment token for tenant %s", req.TenantID), c.IP())
+	// Synchronous: operator only sees the bundle after the audit
+	// row is durable. Codex round-6 #2/#3: AuditLogSync now
+	// returns error. The enrollment row + Tailscale key already
+	// exist at this point (orphans on failure), so a non-nil
+	// error here surfaces a 500 but leaves a recoverable
+	// half-state — operator will retry, hit the token_hash UNIQUE
+	// constraint, and the orphan row expires per its 24h TTL.
+	if err := events.AuditLogSync(userID, "enrollment_token.mint", "enrollment_token", id,
+		fmt.Sprintf("minted enrollment token for tenant %s", req.TenantID), c.IP()); err != nil {
+		slog.Error("enrollment: audit write", "error", err, "row_id", id)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error":  "failed to write audit record",
+			"code":   "audit_write_failed",
+			"row_id": id,
+		})
+	}
 
 	return c.JSON(fiber.Map{
 		"enrollment_token":       plaintext,

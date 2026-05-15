@@ -2,7 +2,9 @@ package events
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 
 	"vaporrmm/vantage/internal/crypto"
@@ -43,8 +45,12 @@ func setupEventsTest(t *testing.T) {
 func TestAuditLogSync_ChainContinuity(t *testing.T) {
 	setupEventsTest(t)
 
-	AuditLogSync("user-1", "test.action.first", "test", "rid-1", "detail-1", "127.0.0.1")
-	AuditLogSync("user-1", "test.action.second", "test", "rid-2", "detail-2", "127.0.0.1")
+	if err := AuditLogSync("user-1", "test.action.first", "test", "rid-1", "detail-1", "127.0.0.1"); err != nil {
+		t.Fatalf("AuditLogSync 1: %v", err)
+	}
+	if err := AuditLogSync("user-1", "test.action.second", "test", "rid-2", "detail-2", "127.0.0.1"); err != nil {
+		t.Fatalf("AuditLogSync 2: %v", err)
+	}
 
 	rows, err := db.DB.Query(`SELECT chain_seq, signature, action FROM audit_log ORDER BY chain_seq`)
 	if err != nil {
@@ -134,5 +140,67 @@ func TestRecordAuditCheckpoint_RejectsBadCounterpartyType(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("CHECK constraint should reject 'agent' counterparty_type; got %d rows", count)
+	}
+}
+
+// TestAuditLogSync_DBError: drop audit_log; AuditLogSync must
+// return an error (rather than logging-and-eating-it like the
+// pre-round-6 implementation).
+func TestAuditLogSync_DBError(t *testing.T) {
+	setupEventsTest(t)
+	if _, err := db.DB.Exec(`DROP TABLE audit_log CASCADE`); err != nil {
+		t.Fatalf("drop audit_log: %v", err)
+	}
+	err := AuditLogSync("u", "test.action", "test", "rid", "details", "127.0.0.1")
+	if err == nil {
+		t.Error("AuditLogSync should return error when table is unavailable")
+	}
+}
+
+// TestAuditLog_ChainIntegrityUnderConcurrent: N goroutines call
+// AuditLogSync concurrently. Resulting rows must form a strict
+// sequence (chain_seq 1..N with no gaps, no duplicates) and each
+// row's signature must equal HMAC(prev_signature || canonical).
+// Without the pg_advisory_xact_lock serialization, concurrent
+// writers race on chain head reads and produce broken chains.
+func TestAuditLog_ChainIntegrityUnderConcurrent(t *testing.T) {
+	setupEventsTest(t)
+
+	const N = 20
+	var wg sync.WaitGroup
+	errs := make([]error, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = AuditLogSync("u", fmt.Sprintf("test.concurrent.%d", i), "test", fmt.Sprintf("r%d", i), "d", "127.0.0.1")
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: %v", i, err)
+		}
+	}
+
+	rows, err := db.DB.Query(`SELECT chain_seq FROM audit_log ORDER BY chain_seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var seqs []int64
+	for rows.Next() {
+		var s int64
+		rows.Scan(&s)
+		seqs = append(seqs, s)
+	}
+	if len(seqs) != N {
+		t.Fatalf("expected %d audit rows, got %d", N, len(seqs))
+	}
+	for i, s := range seqs {
+		if s != int64(i+1) {
+			t.Errorf("chain_seq gap or duplicate at position %d: got %d, expected %d", i, s, i+1)
+		}
 	}
 }

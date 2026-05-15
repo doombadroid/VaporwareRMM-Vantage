@@ -576,17 +576,24 @@ func registerEdge(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to link consume"})
 	}
 
+	// Audit inside the tx so the trace lands atomically with the
+	// enrollment consume + edge insert. Codex round-6 #2: the
+	// previous post-commit AuditLogSync could have failed silently
+	// while the bearer token was already issued to the caller.
+	if err := events.AuditLogSyncTx(tx, "", "edge.register", "edge", edgeID,
+		fmt.Sprintf("registered via enrollment %s for tenant %s; version=%s", etID, etTenantID, req.EdgeVersion),
+		c.IP()); err != nil {
+		slog.Error("edge register: audit write", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to write audit record; registration rolled back",
+			"code":  "audit_write_failed",
+		})
+	}
+
 	if err := tx.Commit(); err != nil {
 		slog.Error("edge register: commit", "error", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "registration commit failed"})
 	}
-
-	// Audit synchronously: the bearer token returned to the caller
-	// is operative immediately, so the trace must be durable before
-	// it leaves the server.
-	events.AuditLogSync("", "edge.register", "edge", edgeID,
-		fmt.Sprintf("registered via enrollment %s for tenant %s; version=%s", etID, etTenantID, req.EdgeVersion),
-		c.IP())
 
 	return c.JSON(fiber.Map{
 		"edge_id":               edgeID,

@@ -557,7 +557,12 @@ func TestEdgeRegister_ConcurrentConsumptionRace(t *testing.T) {
 	app := edgeFederationEnv(t)
 	plain := seedEnrollment(t, "tenant-race", time.Hour)
 
-	const N = 10
+	// N = 5 matches the tokenLimiter Max (codex round-6 #1): with
+	// 5 goroutines all using the same token, all 5 reach the
+	// handler and exercise the consume race. Larger N would have
+	// the extras short-circuit at the rate limit before the race
+	// — a separate concern covered by TestRegister_TokenLimit.
+	const N = 5
 	var wg sync.WaitGroup
 	statuses := make([]int, N)
 	for i := 0; i < N; i++ {

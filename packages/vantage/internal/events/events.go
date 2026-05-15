@@ -9,18 +9,21 @@
 //     || canonical(row))). Edge's audit_logs table uses the same
 //     column name so the cross-system verification CLI (Q9 v1.1) can
 //     read both chains without dialect translation.
-//   - Within-process serialization via auditChainMu so concurrent
-//     callers see a well-defined chain. Postgres handles
-//     cross-instance serialization via row-level locking in F2 when
-//     multi-node Vantage becomes a real scenario.
 //   - HMAC key derived from SECRETS_ENCRYPTION_KEY with a domain
 //     tag (crypto.HMACSHA256 handles this) so an attacker who
 //     recovers a signature can't reuse it as ciphertext or vice
 //     versa.
+//   - Chain writes serialize via a transaction-scoped Postgres
+//     advisory lock (pg_advisory_xact_lock with auditChainLockID).
+//     A within-process mutex is insufficient under #22 Q10 multi-
+//     node — the advisory lock spans every connection to the DB.
 //
-// AuditLog is fire-and-forget: handler latency does not block on
-// the chain mutex or the INSERT. Operators who need synchronous
-// audit (post-action ack-on-audit) call AuditLogSync directly.
+// `*Sync` contract (codex round-6 audit):
+//   - AuditLogSync       — durability before return. Returns error.
+//   - AuditLogSyncTx     — same, but participates in caller's tx.
+//   - AuditLog           — fire-and-forget. Discards error.
+//   - RecordAuditCheckpointSync — durability before return. Returns error.
+//   - RecordAuditCheckpoint     — fire-and-forget. Discards error.
 package events
 
 import (
@@ -28,68 +31,102 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"vaporrmm/vantage/internal/crypto"
 	"vaporrmm/vantage/internal/db"
 )
 
-var auditChainMu sync.Mutex
+// auditChainLockID is the pg_advisory_xact_lock key used to
+// serialize audit-chain writes. Any int8 works; this constant
+// distinguishes it from other advisory locks the codebase might
+// add later.
+const auditChainLockID int64 = 0xA0D17
 
 // AuditLog records an admin action asynchronously. Errors are
-// logged at slog.Error level — silent audit-write failures are
-// exactly the gap the audit log exists to prevent, so they get
-// loud visibility.
+// logged at slog.Error level. Use AuditLogSync (or
+// AuditLogSyncTx) for code paths that must observe the row landed
+// before returning.
 func AuditLog(userID, action, resourceType, resourceID, details, ip string) {
-	go AuditLogSync(userID, action, resourceType, resourceID, details, ip)
+	go func() {
+		if err := AuditLogSync(userID, action, resourceType, resourceID, details, ip); err != nil {
+			slog.Error("audit: async write failed", "error", err, "action", action)
+		}
+	}()
 }
 
-// AuditLogSync is the synchronous variant. Used directly by code
-// paths that must observe the row landed before returning to the
-// caller (e.g., the future F2 federation pairing handler that
-// audits a new Edge registration; the operator UI confirms the
-// pairing only after the audit row is durable).
-func AuditLogSync(userID, action, resourceType, resourceID, details, ip string) {
-	auditChainMu.Lock()
-	defer auditChainMu.Unlock()
-
-	prevSeq, prevSignature, err := loadChainHead()
+// AuditLogSync writes an audit row in its own transaction and
+// returns the error to the caller. Codex round-6 #2/#3: callers
+// that must enforce "audit landed before response" need the error
+// to propagate up.
+func AuditLogSync(userID, action, resourceType, resourceID, details, ip string) error {
+	tx, err := db.DB.Begin()
 	if err != nil {
-		slog.Warn("audit: failed to load chain head; row will write but chain may be discontinuous", "error", err)
+		return fmt.Errorf("audit: begin tx: %w", err)
 	}
+	defer func() { _ = tx.Rollback() }()
+	if err := AuditLogSyncTx(tx, userID, action, resourceType, resourceID, details, ip); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// AuditLogSyncTx writes an audit row inside the caller's
+// transaction. Use when an audit write must be atomic with other
+// state changes (e.g., enrollment_tokens INSERT + audit row land
+// together so a failure rolls back both).
+//
+// The chain head is read with the transaction-scoped advisory lock
+// held, so concurrent writers in other transactions block until
+// this one commits. Chain integrity (monotonic seq + correct
+// predecessor signature) is preserved across processes per #22 Q10.
+func AuditLogSyncTx(tx *sql.Tx, userID, action, resourceType, resourceID, details, ip string) error {
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, auditChainLockID); err != nil {
+		return fmt.Errorf("audit: acquire chain lock: %w", err)
+	}
+
+	prevSeq, prevSignature, err := loadChainHeadTx(tx)
+	if err != nil {
+		return fmt.Errorf("audit: read chain head: %w", err)
+	}
+
 	seq := prevSeq + 1
 	canonical := canonicalRow(seq, userID, action, resourceType, resourceID, details, ip, time.Now().Unix())
 	signature := crypto.HMACSHA256("audit", prevSignature+"|"+canonical)
 
-	if _, err := db.DB.Exec(
+	if _, err := tx.Exec(
 		`INSERT INTO audit_log (chain_seq, signature, user_id, action, resource_type, resource_id, details, ip)
-		   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		seq, signature, nullable(userID), action, resourceType, nullable(resourceID), nullable(details), nullable(ip),
 	); err != nil {
-		slog.Error("audit: write failed",
-			"error", err,
-			"action", action,
-			"user", userID,
-			"resource_type", resourceType,
-		)
+		return fmt.Errorf("audit: write row: %w", err)
 	}
+	return nil
 }
 
-// LatestChainHead is the exported variant of loadChainHead used by
-// poll handlers that need to return Vantage's current chain head
-// to the counterparty for their cross-attestation. Same return
-// shape: (chain_seq, signature) or (0, "") on empty chain.
+// LatestChainHead returns Vantage's current chain head without
+// taking a lock. Read-only; safe for handlers that need to surface
+// the head to a counterparty.
 func LatestChainHead() (int64, string, error) { return loadChainHead() }
 
-// loadChainHead returns the highest (chain_seq, signature) pair
-// currently in the table, or (0, "") if the table is empty (the
-// genesis-row case). The HMAC over prev_signature="" + canonical(row=1)
-// is the genesis signature for the chain.
 func loadChainHead() (int64, string, error) {
 	var seq sql.NullInt64
 	var signature sql.NullString
 	err := db.DB.QueryRow(`SELECT chain_seq, signature FROM audit_log ORDER BY chain_seq DESC LIMIT 1`).
+		Scan(&seq, &signature)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	return seq.Int64, signature.String, nil
+}
+
+func loadChainHeadTx(tx *sql.Tx) (int64, string, error) {
+	var seq sql.NullInt64
+	var signature sql.NullString
+	err := tx.QueryRow(`SELECT chain_seq, signature FROM audit_log ORDER BY chain_seq DESC LIMIT 1`).
 		Scan(&seq, &signature)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", nil
