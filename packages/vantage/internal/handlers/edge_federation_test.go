@@ -1025,3 +1025,121 @@ func TestEvents_CheckpointWriteFails(t *testing.T) {
 		t.Errorf("body should carry code=checkpoint_write_failed, got %s", body)
 	}
 }
+
+// TestEdgePoll_StaleTokenDoesNotMutateState — codex round-4
+// findings #1/#2. After EdgeAuthMiddleware validates T1, a peer
+// rotation can land before pollEdge reaches its rotation check.
+// The handler must reject with 401 and leave NO operator-visible
+// state behind: edge_version untouched, no audit_checkpoint
+// written.
+//
+// We reproduce the race deterministically by inserting a Fiber
+// step BETWEEN middleware and pollEdge that mutates the row's
+// token_hash. With the old ordering (side effects before
+// rotation check), this test would observe edge_version mutated
+// to the stale request's value AND a checkpoint row written.
+// With the new ordering, neither happens.
+func TestEdgePoll_StaleTokenDoesNotMutateState(t *testing.T) {
+	url := os.Getenv("VANTAGE_TEST_PG_URL")
+	if url == "" {
+		t.Skip("set VANTAGE_TEST_PG_URL")
+	}
+	if err := crypto.SetKeyForTests(tailscaleTestEncryptionKey); err != nil {
+		t.Fatalf("crypto SetKeyForTests: %v", err)
+	}
+	t.Setenv("DATABASE_URL", url)
+
+	conn, _ := sql.Open("postgres", url)
+	_, _ = conn.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+	_ = conn.Close()
+	t.Cleanup(func() {
+		if db.DB != nil {
+			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+			_ = db.DB.Close()
+			db.DB = nil
+		}
+	})
+	if err := db.Init(); err != nil {
+		t.Fatalf("db.Init: %v", err)
+	}
+	if _, err := db.DB.Exec(
+		`INSERT INTO users (id, email, password_hash, role) VALUES ('seed-admin', 'admin@vaporrmm-vantage.local', 'x', 'super_admin')`,
+	); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	plain := seedEdgeForPoll(t, "edge-stale-mut", "tenant-1", 3*24*time.Hour)
+	// Pre-set edge_version to a known value so the test can detect
+	// mutation by string compare.
+	if _, err := db.DB.Exec(`UPDATE edges SET edge_version = '0.1.0-baseline' WHERE id = 'edge-stale-mut'`); err != nil {
+		t.Fatalf("set baseline version: %v", err)
+	}
+
+	// Build app: middleware → injector → pollEdge. The injector
+	// rotates the row's token_hash between middleware's validation
+	// and pollEdge's rotation check, deterministically driving the
+	// in-tx mismatch path.
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Post("/api/edge/poll",
+		auth.EdgeAuthMiddleware(),
+		func(c *fiber.Ctx) error {
+			edgeID, _ := c.Locals("edge_id").(string)
+			winnerHash := auth.HashToken("vet_concurrent_winner_42")
+			if _, err := db.DB.Exec(`UPDATE edges SET token_hash = $1 WHERE id = $2`, winnerHash, edgeID); err != nil {
+				return c.Status(500).SendString("injector failed: " + err.Error())
+			}
+			return c.Next()
+		},
+		pollEdge,
+	)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"edge_version": "0.9.9-stale-shouldnt-stick",
+		"audit_chain_head": map[string]interface{}{
+			"seq":       int64(99),
+			"signature": "stale-sig",
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/edge/poll", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+plain)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 401, got %d body=%s", resp.StatusCode, body)
+	}
+	var out struct {
+		Code string `json:"code"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Code != "token_concurrently_rotated" {
+		t.Errorf("expected code=token_concurrently_rotated, got %q", out.Code)
+	}
+
+	// edge_version must be unchanged. The handler's UPDATE happens
+	// AFTER the rotation check now, so the stale request can't
+	// land "0.9.9-stale-shouldnt-stick".
+	var afterVersion string
+	if err := db.DB.QueryRow(`SELECT COALESCE(edge_version, '') FROM edges WHERE id = 'edge-stale-mut'`).Scan(&afterVersion); err != nil {
+		t.Fatalf("read edge_version: %v", err)
+	}
+	if afterVersion != "0.1.0-baseline" {
+		t.Errorf("edge_version mutated on rejected 401 path: got %q, want 0.1.0-baseline", afterVersion)
+	}
+
+	// No audit_checkpoint row should have been written for this
+	// counterparty.
+	var checkpoints int
+	if err := db.DB.QueryRow(
+		`SELECT COUNT(*) FROM audit_checkpoints WHERE counterparty_id = 'edge-stale-mut'`,
+	).Scan(&checkpoints); err != nil {
+		t.Fatalf("count checkpoints: %v", err)
+	}
+	if checkpoints != 0 {
+		t.Errorf("audit_checkpoint written on 401 path: %d rows", checkpoints)
+	}
+}

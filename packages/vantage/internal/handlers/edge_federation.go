@@ -264,6 +264,31 @@ func pollEdge(c *fiber.Ctx) error {
 		})
 	}
 
+	// Rotation race gate first (codex round-4 #1/#2). Every
+	// state-mutating side effect — edge_version UPDATE, audit
+	// checkpoint write — must happen AFTER the rotation race
+	// check succeeds. A stale-token poll that loses the race
+	// returns 401 without leaving operator-visible state behind.
+	//
+	// Middleware's last_seen_at UPDATE stays where it is. That
+	// reflects "this token presented itself" which is still true
+	// for a race-loser and is useful as a reachability signal.
+	presentedToken := extractBearerToken(c)
+	presentedHash := auth.HashToken(presentedToken)
+	rotatedToken, newExpiresAt, err := maybeRotateToken(edgeID, presentedHash)
+	if errors.Is(err, ErrTokenHashMismatch) {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "token has been rotated concurrently; re-authenticate with the latest token",
+			"code":  "token_concurrently_rotated",
+		})
+	}
+	if err != nil {
+		slog.Error("poll: rotate check", "error", err, "edge_id", edgeID)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotation check failed"})
+	}
+
+	// Past the race gate. Side effects are now safe to land.
+
 	// Update Edge's reported version on every poll so the operator
 	// dashboard reflects current state without waiting for the next
 	// register. Best-effort.
@@ -280,25 +305,6 @@ func pollEdge(c *fiber.Ctx) error {
 			"error": "failed to record audit checkpoint",
 			"code":  "checkpoint_write_failed",
 		})
-	}
-
-	// Token rotation. Re-hash the bearer the request arrived with;
-	// maybeRotateToken's tx revalidates that hash against the row
-	// (defense against concurrent-poll races where the middleware
-	// validated against a token that's since been rotated by a
-	// peer request — codex round-3 finding #1).
-	presentedToken := extractBearerToken(c)
-	presentedHash := auth.HashToken(presentedToken)
-	rotatedToken, newExpiresAt, err := maybeRotateToken(edgeID, presentedHash)
-	if errors.Is(err, ErrTokenHashMismatch) {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "token has been rotated concurrently; re-authenticate with the latest token",
-			"code":  "token_concurrently_rotated",
-		})
-	}
-	if err != nil {
-		slog.Error("poll: rotate check", "error", err, "edge_id", edgeID)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "rotation check failed"})
 	}
 
 	vantageSeq, vantageSig, err := events.LatestChainHead()
