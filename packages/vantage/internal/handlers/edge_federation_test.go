@@ -663,3 +663,61 @@ func TestEdgePoll_TokenRotation_OldTokenImmediatelyInvalid(t *testing.T) {
 		t.Errorf("new token should succeed, got %d", resp3.StatusCode)
 	}
 }
+
+// TestEdgeRegister_RateLimitPerToken: hammer /register with the
+// same enrollment_token. After 10 attempts in a minute the 11th
+// should hit the rate limit (429) — not 401. Proves the limiter
+// is per-token, not per-attempt.
+func TestEdgeRegister_RateLimitPerToken(t *testing.T) {
+	app := edgeFederationEnv(t)
+	const sameToken = "vrt_unknown_burner"
+
+	statuses := make([]int, 11)
+	for i := 0; i < 11; i++ {
+		resp := postEdgeRegister(t, app, map[string]string{
+			"enrollment_token": sameToken,
+			"edge_version":     "0.1.0",
+		})
+		statuses[i] = resp.StatusCode
+		resp.Body.Close()
+	}
+	limit429Count := 0
+	auth401Count := 0
+	for _, s := range statuses {
+		switch s {
+		case http.StatusTooManyRequests:
+			limit429Count++
+		case http.StatusUnauthorized:
+			auth401Count++
+		}
+	}
+	if auth401Count != 10 {
+		t.Errorf("expected first 10 attempts to be 401, got auth401Count=%d (statuses: %v)", auth401Count, statuses)
+	}
+	if limit429Count != 1 {
+		t.Errorf("expected exactly one 429 (11th), got %d (statuses: %v)", limit429Count, statuses)
+	}
+}
+
+// TestEdgeRegister_RateLimitScopedPerToken: 11 distinct tokens
+// from a single source — each gets its own bucket so none of
+// them should hit the limit. Proves the limiter is NOT collapsing
+// to per-IP buckets (which would have rejected the 11th).
+func TestEdgeRegister_RateLimitScopedPerToken(t *testing.T) {
+	app := edgeFederationEnv(t)
+
+	statuses := make([]int, 11)
+	for i := 0; i < 11; i++ {
+		resp := postEdgeRegister(t, app, map[string]string{
+			"enrollment_token": fmt.Sprintf("vrt_distinct_burner_%d", i),
+			"edge_version":     "0.1.0",
+		})
+		statuses[i] = resp.StatusCode
+		resp.Body.Close()
+	}
+	for i, s := range statuses {
+		if s == http.StatusTooManyRequests {
+			t.Errorf("request %d hit 429; per-token bucket should have allowed it (statuses: %v)", i, statuses)
+		}
+	}
+}

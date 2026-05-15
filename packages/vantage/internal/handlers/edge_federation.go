@@ -7,8 +7,10 @@ package handlers
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,21 +52,40 @@ const tokenRotationWindow = 7 * 24 * time.Hour
 // authed routes (commits 10/11) get wired through their own
 // middleware chain.
 func RegisterEdgeRoutes(app *fiber.App) {
-	// Per-IP limiter on register: enrollment tokens are 256-bit
-	// random, so brute-forcing is impossible in practice, but
-	// rate-limiting still cuts off a misbehaving caller before
-	// they fill the audit log with bogus attempts.
+	// Per-enrollment-token limiter on register. Codex finding #3
+	// flagged that c.IP() collapses to the reverse proxy's address
+	// behind Caddy, making per-IP buckets useless. Key by a hash
+	// of the enrollment_token from the request body so the limit
+	// is "10 attempts on this specific token per minute" — the
+	// attack surface the limit actually defends against (brute-
+	// forcing a known-issued enrollment token).
+	//
+	// Body-parse note: Fiber caches the request body in
+	// c.Request().Body() and re-reads on every BodyParser call,
+	// so the downstream handler can still parse normally after
+	// the KeyGenerator peeks at it.
 	//
 	// Multi-node note (#22 Q10): Fiber's default limiter is
 	// in-memory per process. With multi-node Vantage, each node
 	// enforces its own quota — total fleet quota is N * 10 per
-	// minute. A Redis-backed limiter is the upgrade path; F2
-	// ships in-memory since single-node is the v1 deployment.
+	// token per minute. A Redis-backed limiter is the upgrade
+	// path; F2 ships in-memory since single-node is the v1
+	// deployment.
 	registerLimiter := limiter.New(limiter.Config{
 		Max:        10,
 		Expiration: time.Minute,
 		KeyGenerator: func(c *fiber.Ctx) string {
-			return c.IP()
+			var body struct {
+				EnrollmentToken string `json:"enrollment_token"`
+			}
+			if err := c.BodyParser(&body); err != nil {
+				return "ip:" + c.IP()
+			}
+			if body.EnrollmentToken == "" {
+				return "ip:" + c.IP()
+			}
+			sum := sha256.Sum256([]byte(body.EnrollmentToken))
+			return "tok:" + hex.EncodeToString(sum[:])[:16]
 		},
 		LimitReached: func(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
