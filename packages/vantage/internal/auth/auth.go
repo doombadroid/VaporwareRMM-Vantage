@@ -21,11 +21,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -86,6 +89,45 @@ func Init() error {
 		)
 	}
 	JWTSecret = []byte(sec)
+
+	// VANTAGE_PUBLIC_URL validation (codex round-5 #3). Required
+	// non-empty + parseable + scheme/host present. The handler-time
+	// uses ("vantage_url" in the enrollment bundle, cookie-secure
+	// cross-check) expect a valid URL, so we refuse to boot rather
+	// than ship malformed values into operator-facing artifacts.
+	publicURL := os.Getenv("VANTAGE_PUBLIC_URL")
+	if publicURL == "" {
+		return errors.New(
+			"VANTAGE_PUBLIC_URL is required. Set to the tailnet-routable URL Edges will reach Vantage at, e.g. https://vantage.yourtailnet.ts.net",
+		)
+	}
+	parsed, err := neturl.Parse(publicURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		errStr := ""
+		if err != nil {
+			errStr = ": " + err.Error()
+		}
+		return fmt.Errorf(
+			"VANTAGE_PUBLIC_URL=%q is not a valid URL (need scheme and host, e.g. https://vantage.yourtailnet.ts.net)%s",
+			publicURL, errStr,
+		)
+	}
+	secureCookies := os.Getenv("FORCE_SECURE_COOKIES") != "false"
+	scheme := strings.ToLower(parsed.Scheme)
+	if secureCookies && scheme != "https" {
+		return fmt.Errorf(
+			"VANTAGE_PUBLIC_URL=%q must use https in production. Use http only with FORCE_SECURE_COOKIES=false (local dev).",
+			publicURL,
+		)
+	}
+	if !secureCookies && scheme == "https" {
+		return errors.New(
+			"refusing to boot: FORCE_SECURE_COOKIES=false but VANTAGE_PUBLIC_URL is https — " +
+				"the combination would issue non-Secure auth cookies to a TLS deployment. " +
+				"Unset FORCE_SECURE_COOKIES (defaults to true) for production, or set VANTAGE_PUBLIC_URL " +
+				"to an http:// URL if this really is local development",
+		)
+	}
 	return nil
 }
 
@@ -287,13 +329,34 @@ func CSRFMiddleware() fiber.Handler {
 	}
 }
 
+// cookieSecure decides whether the Set-Cookie response carries
+// the Secure flag.
+//
+// The original implementation derived the flag from c.Protocol()
+// ("https"). Codex review on PR #1 flagged the bug: when Vantage
+// runs behind a TLS-terminating proxy (Caddy in our standard
+// deployment), the backend connection is plain HTTP — c.Protocol()
+// returns "http", Secure is unset, and browsers will send the
+// auth cookie over plain HTTP to any same-origin URL.
+//
+// New rule: cookies are always Secure unless the operator
+// explicitly opts out via FORCE_SECURE_COOKIES=false. Default
+// secure means a misconfigured dev environment fails noisy
+// (cookie won't stick over http://localhost without the opt-out)
+// rather than a misconfigured production environment failing
+// silent (cookies fly cleartext).
+//
+// The startup sanity check in main.go refuses to boot when
+// PUBLIC_URL is https and FORCE_SECURE_COOKIES is false — that
+// combination is almost always an operator mistake.
+func cookieSecure() bool {
+	return os.Getenv("FORCE_SECURE_COOKIES") != "false"
+}
+
 // SetSessionCookies writes the auth_token (httpOnly) and csrf_token
-// (JS-readable) cookies on a successful login. Secure=true is set
-// based on the request scheme — operators running Vantage behind
-// Caddy with TLS get Secure cookies; local dev over HTTP doesn't
-// (otherwise the cookie wouldn't stick).
+// (JS-readable) cookies on a successful login.
 func SetSessionCookies(c *fiber.Ctx, jwtPlain, csrfVal string) {
-	secure := c.Protocol() == "https"
+	secure := cookieSecure()
 	c.Cookie(&fiber.Cookie{
 		Name:     authCookie,
 		Value:    jwtPlain,
@@ -316,12 +379,13 @@ func SetSessionCookies(c *fiber.Ctx, jwtPlain, csrfVal string) {
 
 // ClearSessionCookies wipes both cookies on logout.
 func ClearSessionCookies(c *fiber.Ctx) {
+	secure := cookieSecure()
 	for _, name := range []string{authCookie, csrfCookie} {
 		c.Cookie(&fiber.Cookie{
 			Name:     name,
 			Value:    "",
 			HTTPOnly: name == authCookie,
-			Secure:   c.Protocol() == "https",
+			Secure:   secure,
 			SameSite: "Strict",
 			Path:     "/",
 			MaxAge:   -1,
@@ -332,6 +396,107 @@ func ClearSessionCookies(c *fiber.Ctx) {
 // IsSuperAdmin: convenience predicate. Federation will introduce
 // finer roles in F2-F8; F1 keeps the two-role model from Edge.
 func IsSuperAdmin(role string) bool { return role == "super_admin" }
+
+// EdgeAuthMiddleware validates federation Bearer tokens for the
+// /api/edge/poll and /api/edge/events endpoints.
+//
+// Per the design lock in #22 Q2, this layer was originally going
+// to include a defense-in-depth check binding the Edge token to
+// the source tailnet_ip recorded at registration. Codex review on
+// PR #1 surfaced (correctly) that application-layer access to the
+// real tailnet source IP is not reliable: when Vantage runs behind
+// a reverse proxy (Caddy in production), c.IP() resolves to the
+// proxy or to whatever X-Forwarded-For carries, not the original
+// tailnet IP. Even direct-attached, the IP isn't a strong identity
+// binding — addresses can change, be spoofed in some topologies,
+// etc.
+//
+// The IP check was removed in F2 review (commit history). The
+// active defense surface in F2 is:
+//
+//   - Tailscale network identity: only tailnet members can reach
+//     Vantage's tailnet endpoint at all (network-layer ACL).
+//
+//   - Per-Edge Bearer token: SHA-256 hashed at rest, 30-day TTL
+//     with poll-time rotation, application-layer cryptographic
+//     identity per Edge.
+//
+// Future hardening (out of scope for F2): mTLS using Tailscale-
+// issued node certificates, or a Tailscale-aware sidecar that
+// surfaces verified peer identity into a request header Vantage
+// can trust. Track follow-up against #22.
+//
+// Q10 still applies: no in-memory cache. Every request hits
+// Postgres for the token-hash lookup. Redis cache with PUB/SUB
+// invalidation is the optimization path if poll throughput at
+// scale requires it.
+func EdgeAuthMiddleware() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		// RFC 7235 §2.1: auth-scheme names are case-insensitive.
+		// Clients in the wild send "Bearer", "bearer", and
+		// occasionally "BEARER"; codex finding #4 caught that the
+		// strict HasPrefix("Bearer ") check rejected everything
+		// but Title case.
+		const scheme = "bearer "
+		authHeader := strings.TrimSpace(c.Get("Authorization"))
+		if len(authHeader) < len(scheme) || !strings.EqualFold(authHeader[:len(scheme)], scheme) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "missing or malformed Authorization header",
+				"code":  401,
+			})
+		}
+		token := strings.TrimSpace(authHeader[len(scheme):])
+		if token == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "empty bearer token", "code": 401})
+		}
+
+		tokenHash := HashToken(token)
+
+		var (
+			edgeID          string
+			tenantID        string
+			tailnetIdentity sql.NullString
+			tokenExpiresAt  sql.NullInt64
+		)
+		err := db.DB.QueryRow(
+			`SELECT id, tenant_id, tailnet_identity, token_expires_at
+			   FROM edges
+			   WHERE token_hash = $1 AND status = 'active'`,
+			tokenHash,
+		).Scan(&edgeID, &tenantID, &tailnetIdentity, &tokenExpiresAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unknown or inactive edge token", "code": 401})
+		}
+		if err != nil {
+			slog.Error("edge auth: lookup", "error", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "auth lookup failed"})
+		}
+
+		// Boundary semantics: a token whose token_expires_at lands
+		// on exactly the current second is expired. The pre-fix `<`
+		// comparison routed exactly-at-expiry tokens to the
+		// downstream "unreachable" 500 path. <= treats the boundary
+		// as expired consistently.
+		if tokenExpiresAt.Valid && tokenExpiresAt.Int64 <= time.Now().Unix() {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "edge token expired", "code": 401})
+		}
+
+		// Heartbeat. Update last_seen_at on every successful auth.
+		// The poll handler doesn't repeat this — middleware-level
+		// gives every authenticated request the same freshness.
+		if _, err := db.DB.Exec(
+			`UPDATE edges SET last_seen_at = $1 WHERE id = $2`,
+			time.Now().Unix(), edgeID,
+		); err != nil {
+			slog.Warn("edge auth: last_seen_at update failed", "error", err, "edge_id", edgeID)
+		}
+
+		c.Locals("edge_id", edgeID)
+		c.Locals("tenant_id", tenantID)
+		c.Locals("tailnet_identity", tailnetIdentity.String)
+		return c.Next()
+	}
+}
 
 // BootstrapAdmin runs at startup. Creates the first admin user if
 // none exist, picking up the password from ADMIN_PASSWORD or
@@ -374,11 +539,24 @@ func BootstrapAdmin() error {
 		return fmt.Errorf("hash admin password: %w", err)
 	}
 	id := uuid.New().String()
-	if _, err := db.DB.Exec(
-		`INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, 'super_admin')`,
+	// ON CONFLICT (email): codex round-6 sweep caught a multi-
+	// process boot race where two nodes both observe count=0 and
+	// both INSERT. The second-runner would have crashed on the
+	// email UNIQUE constraint. ON CONFLICT DO NOTHING lets the
+	// race-loser silently no-op; admin exists either way.
+	result, err := db.DB.Exec(
+		`INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, 'super_admin') ON CONFLICT (email) DO NOTHING`,
 		id, "admin@vaporrmm-vantage.local", hash,
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("insert admin: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		// Race-lost: another booting node already created the
+		// admin. Don't print "FIRST-RUN ADMIN PASSWORD" — the
+		// winner already did.
+		slog.Info("admin bootstrap: row already existed (race-lost on concurrent boot); no first-run banner emitted")
+		return nil
 	}
 	if generated {
 		// Print to stdout (not slog) so it doesn't get tangled in

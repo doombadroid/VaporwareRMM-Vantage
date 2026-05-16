@@ -42,6 +42,8 @@ func RegisterPublicRoutes(app *fiber.App) {
 func RegisterAuthedRoutes(g fiber.Router) {
 	g.Get("/users/me", currentUserHandler)
 	g.Get("/edges", listEdgesHandler)
+	RegisterTailscaleRoutes(g)
+	RegisterEnrollmentRoutes(g)
 }
 
 func healthHandler(c *fiber.Ctx) error {
@@ -133,15 +135,27 @@ func currentUserHandler(c *fiber.Ctx) error {
 	return c.JSON(out)
 }
 
-// Edge is the JSON shape returned by /api/v1/edges. F1 returns an
-// empty list. F2 populates the table via the federation pairing
-// flow and additional columns get added to this struct.
+// Edge is the JSON shape returned by /api/v1/edges. F2 widens the
+// schema; subsequent phases may add more (drill-through metadata,
+// command queue depth, etc.) without breaking the dashboard since
+// the contract only adds optional fields, not removes/renames them.
+//
+// token_hash is intentionally never serialized — the plaintext is
+// returned exactly once at registration and the hash is for
+// server-side lookup only.
 type Edge struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	TenantID  string `json:"tenant_id"`
-	Status    string `json:"status"`
-	CreatedAt int64  `json:"created_at"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	TenantID        string `json:"tenant_id"`
+	Status          string `json:"status"`
+	TailnetIP       string `json:"tailnet_ip,omitempty"`
+	TailnetIdentity string `json:"tailnet_identity,omitempty"`
+	EdgeVersion     string `json:"edge_version,omitempty"`
+	LastSeenAt      int64  `json:"last_seen_at,omitempty"`
+	TokenExpiresAt  int64  `json:"token_expires_at,omitempty"`
+	CreatedAt       int64  `json:"created_at"`
+	DecommissionedAt int64 `json:"decommissioned_at,omitempty"`
+	OperatorNotes   string `json:"operator_notes,omitempty"`
 }
 
 func listEdgesHandler(c *fiber.Ctx) error {
@@ -153,7 +167,18 @@ func listEdgesHandler(c *fiber.Ctx) error {
 	}
 
 	rows, err := db.DB.Query(
-		`SELECT id, COALESCE(name, ''), tenant_id, status, EXTRACT(EPOCH FROM created_at)::bigint
+		`SELECT id,
+		        COALESCE(name, ''),
+		        tenant_id,
+		        status,
+		        COALESCE(tailnet_ip, ''),
+		        COALESCE(tailnet_identity, ''),
+		        COALESCE(edge_version, ''),
+		        COALESCE(last_seen_at, 0),
+		        COALESCE(token_expires_at, 0),
+		        created_at,
+		        COALESCE(decommissioned_at, 0),
+		        COALESCE(operator_notes, '')
 		   FROM edges
 		  ORDER BY created_at DESC
 		  LIMIT $1 OFFSET $2`,
@@ -164,10 +189,13 @@ func listEdgesHandler(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	out := []Edge{} // never nil — the empty-state UI renders [] correctly
+	out := []Edge{}
 	for rows.Next() {
 		var e Edge
-		if err := rows.Scan(&e.ID, &e.Name, &e.TenantID, &e.Status, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.Name, &e.TenantID, &e.Status,
+			&e.TailnetIP, &e.TailnetIdentity, &e.EdgeVersion,
+			&e.LastSeenAt, &e.TokenExpiresAt, &e.CreatedAt,
+			&e.DecommissionedAt, &e.OperatorNotes); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "scan failed"})
 		}
 		out = append(out, e)

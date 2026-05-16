@@ -69,7 +69,7 @@ func TestInit_AcceptsValidPostgresURL_AndAppliesMigrations(t *testing.T) {
 			// Drop F1 tables so a re-run starts clean. The
 			// schema_migrations row tracks the version — drop
 			// that too so the migration re-applies.
-			_, _ = DB.Exec(`DROP TABLE IF EXISTS audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+			_, _ = DB.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 			_ = DB.Close()
 			DB = nil
 		}

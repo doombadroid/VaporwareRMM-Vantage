@@ -5,20 +5,25 @@
 // The audit chain mirrors Edge's pattern from PR #5 / Codex #6:
 //
 //   - Each row carries chain_seq (monotonic, gap-free per chain) and
-//     chain_hash (HMAC-SHA256(SECRETS_ENCRYPTION_KEY, previous_hash
-//     || canonical(row))).
-//   - Within-process serialization via auditChainMu so concurrent
-//     callers see a well-defined chain. Postgres handles
-//     cross-instance serialization via row-level locking in F2 when
-//     multi-node Vantage becomes a real scenario.
+//     signature (HMAC-SHA256(SECRETS_ENCRYPTION_KEY, previous_signature
+//     || canonical(row))). Edge's audit_logs table uses the same
+//     column name so the cross-system verification CLI (Q9 v1.1) can
+//     read both chains without dialect translation.
 //   - HMAC key derived from SECRETS_ENCRYPTION_KEY with a domain
 //     tag (crypto.HMACSHA256 handles this) so an attacker who
 //     recovers a signature can't reuse it as ciphertext or vice
 //     versa.
+//   - Chain writes serialize via a transaction-scoped Postgres
+//     advisory lock (pg_advisory_xact_lock with auditChainLockID).
+//     A within-process mutex is insufficient under #22 Q10 multi-
+//     node — the advisory lock spans every connection to the DB.
 //
-// AuditLog is fire-and-forget: handler latency does not block on
-// the chain mutex or the INSERT. Operators who need synchronous
-// audit (post-action ack-on-audit) call AuditLogSync directly.
+// `*Sync` contract (codex round-6 audit):
+//   - AuditLogSync       — durability before return. Returns error.
+//   - AuditLogSyncTx     — same, but participates in caller's tx.
+//   - AuditLog           — fire-and-forget. Discards error.
+//   - RecordAuditCheckpointSync — durability before return. Returns error.
+//   - RecordAuditCheckpoint     — fire-and-forget. Discards error.
 package events
 
 import (
@@ -26,70 +31,122 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"vaporrmm/vantage/internal/crypto"
 	"vaporrmm/vantage/internal/db"
 )
 
-var auditChainMu sync.Mutex
+// auditChainLockID is the pg_advisory_xact_lock key used to
+// serialize audit-chain writes. Any int8 works; this constant
+// distinguishes it from other advisory locks the codebase might
+// add later.
+const auditChainLockID int64 = 0xA0D17
 
 // AuditLog records an admin action asynchronously. Errors are
-// logged at slog.Error level — silent audit-write failures are
-// exactly the gap the audit log exists to prevent, so they get
-// loud visibility.
+// logged at slog.Error level. Use AuditLogSync (or
+// AuditLogSyncTx) for code paths that must observe the row landed
+// before returning.
 func AuditLog(userID, action, resourceType, resourceID, details, ip string) {
-	go AuditLogSync(userID, action, resourceType, resourceID, details, ip)
+	go func() {
+		if err := AuditLogSync(userID, action, resourceType, resourceID, details, ip); err != nil {
+			slog.Error("audit: async write failed", "error", err, "action", action)
+		}
+	}()
 }
 
-// AuditLogSync is the synchronous variant. Used directly by code
-// paths that must observe the row landed before returning to the
-// caller (e.g., the future F2 federation pairing handler that
-// audits a new Edge registration; the operator UI confirms the
-// pairing only after the audit row is durable).
-func AuditLogSync(userID, action, resourceType, resourceID, details, ip string) {
-	auditChainMu.Lock()
-	defer auditChainMu.Unlock()
-
-	prevSeq, prevHash, err := loadChainHead()
+// AuditLogSync writes an audit row in its own transaction and
+// returns the error to the caller. Codex round-6 #2/#3: callers
+// that must enforce "audit landed before response" need the error
+// to propagate up.
+func AuditLogSync(userID, action, resourceType, resourceID, details, ip string) error {
+	tx, err := db.DB.Begin()
 	if err != nil {
-		slog.Warn("audit: failed to load chain head; row will write but chain may be discontinuous", "error", err)
+		return fmt.Errorf("audit: begin tx: %w", err)
 	}
-	seq := prevSeq + 1
-	canonical := canonicalRow(seq, userID, action, resourceType, resourceID, details, ip, time.Now().Unix())
-	chainHash := crypto.HMACSHA256("audit", prevHash+"|"+canonical)
-
-	if _, err := db.DB.Exec(
-		`INSERT INTO audit_log (chain_seq, chain_hash, user_id, action, resource_type, resource_id, details, ip)
-		   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		seq, chainHash, nullable(userID), action, resourceType, nullable(resourceID), nullable(details), nullable(ip),
-	); err != nil {
-		slog.Error("audit: write failed",
-			"error", err,
-			"action", action,
-			"user", userID,
-			"resource_type", resourceType,
-		)
+	defer func() { _ = tx.Rollback() }()
+	if err := AuditLogSyncTx(tx, userID, action, resourceType, resourceID, details, ip); err != nil {
+		return err
 	}
+	return tx.Commit()
 }
 
-// loadChainHead returns the highest (chain_seq, chain_hash) pair
-// currently in the table, or (0, "") if the table is empty (the
-// genesis-row case). The HMAC over prev_hash="" + canonical(row=1)
-// is the genesis hash for the chain.
+// AuditLogSyncTx writes an audit row inside the caller's
+// transaction. Use when an audit write must be atomic with other
+// state changes (e.g., enrollment_tokens INSERT + audit row land
+// together so a failure rolls back both).
+//
+// The chain head is read with the transaction-scoped advisory lock
+// held, so concurrent writers in other transactions block until
+// this one commits. Chain integrity (monotonic seq + correct
+// predecessor signature) is preserved across processes per #22 Q10.
+func AuditLogSyncTx(tx *sql.Tx, userID, action, resourceType, resourceID, details, ip string) error {
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1)`, auditChainLockID); err != nil {
+		return fmt.Errorf("audit: acquire chain lock: %w", err)
+	}
+
+	prevSeq, prevSignature, err := loadChainHeadTx(tx)
+	if err != nil {
+		return fmt.Errorf("audit: read chain head: %w", err)
+	}
+
+	// Codex round-10 finding #3: capture the timestamp ONCE and
+	// use it for both the canonicalization (signed) and the row
+	// persistence. The previous code used time.Now().Unix() for
+	// the signature and let Postgres' DEFAULT NOW() set
+	// created_at — those two timestamps differ at second
+	// boundaries, breaking verification (a verifier reading the
+	// row gets created_at and recomputes against the signed ts).
+	//
+	// to_timestamp(BIGINT) converts Unix seconds → TIMESTAMPTZ
+	// deterministically; verification reads it back via
+	// EXTRACT(EPOCH FROM created_at)::BIGINT.
+	seq := prevSeq + 1
+	nowUnix := time.Now().Unix()
+	canonical := canonicalRow(seq, userID, action, resourceType, resourceID, details, ip, nowUnix)
+	signature := crypto.HMACSHA256("audit", prevSignature+"|"+canonical)
+
+	if _, err := tx.Exec(
+		`INSERT INTO audit_log (chain_seq, signature, user_id, action, resource_type, resource_id, details, ip, created_at)
+		     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9))`,
+		seq, signature, nullable(userID), action, resourceType, nullable(resourceID), nullable(details), nullable(ip), nowUnix,
+	); err != nil {
+		return fmt.Errorf("audit: write row: %w", err)
+	}
+	return nil
+}
+
+// LatestChainHead returns Vantage's current chain head without
+// taking a lock. Read-only; safe for handlers that need to surface
+// the head to a counterparty.
+func LatestChainHead() (int64, string, error) { return loadChainHead() }
+
 func loadChainHead() (int64, string, error) {
 	var seq sql.NullInt64
-	var hash sql.NullString
-	err := db.DB.QueryRow(`SELECT chain_seq, chain_hash FROM audit_log ORDER BY chain_seq DESC LIMIT 1`).
-		Scan(&seq, &hash)
+	var signature sql.NullString
+	err := db.DB.QueryRow(`SELECT chain_seq, signature FROM audit_log ORDER BY chain_seq DESC LIMIT 1`).
+		Scan(&seq, &signature)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", nil
 	}
 	if err != nil {
 		return 0, "", err
 	}
-	return seq.Int64, hash.String, nil
+	return seq.Int64, signature.String, nil
+}
+
+func loadChainHeadTx(tx *sql.Tx) (int64, string, error) {
+	var seq sql.NullInt64
+	var signature sql.NullString
+	err := tx.QueryRow(`SELECT chain_seq, signature FROM audit_log ORDER BY chain_seq DESC LIMIT 1`).
+		Scan(&seq, &signature)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	return seq.Int64, signature.String, nil
 }
 
 // canonicalRow renders the audit row as a deterministic byte
@@ -108,6 +165,45 @@ func nullable(s string) interface{} {
 		return nil
 	}
 	return s
+}
+
+// RecordAuditCheckpoint persists a counterparty's audit-chain
+// head for cross-attestation. Fire-and-forget — checkpoint failures
+// are logged but the caller doesn't observe them. Use the Sync
+// variant from handlers that must guarantee the checkpoint landed
+// before responding.
+func RecordAuditCheckpoint(counterpartyType, counterpartyID string, chainSeq int64, signature, duringEvent string) {
+	go func() {
+		_ = RecordAuditCheckpointSync(counterpartyType, counterpartyID, chainSeq, signature, duringEvent)
+	}()
+}
+
+// RecordAuditCheckpointSync writes a checkpoint row synchronously
+// and returns the error to the caller. Codex round-3 finding #3:
+// previously this function only logged failures, which meant
+// "Sync" callers (poll/events) couldn't enforce durability-
+// before-response.
+//
+// Callers should fail the request when this returns non-nil so the
+// Edge knows the checkpoint didn't land and can retry. Otherwise
+// the cross-attestation contract from #22 Q9 silently degrades.
+func RecordAuditCheckpointSync(counterpartyType, counterpartyID string, chainSeq int64, signature, duringEvent string) error {
+	if _, err := db.DB.Exec(
+		`INSERT INTO audit_checkpoints
+		     (counterparty_type, counterparty_id, chain_seq, signature, recorded_at, recorded_during)
+		     VALUES ($1, $2, $3, $4, $5, $6)`,
+		counterpartyType, nullable(counterpartyID), chainSeq, signature, time.Now().Unix(), nullable(duringEvent),
+	); err != nil {
+		slog.Error("audit_checkpoint: write failed",
+			"error", err,
+			"counterparty_type", counterpartyType,
+			"counterparty_id", counterpartyID,
+			"chain_seq", chainSeq,
+			"during", duringEvent,
+		)
+		return fmt.Errorf("checkpoint write: %w", err)
+	}
+	return nil
 }
 
 // WSBroadcastMessage is the placeholder for the F2 real-time fan-out.
