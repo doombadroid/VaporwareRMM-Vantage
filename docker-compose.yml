@@ -41,11 +41,11 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       VANTAGE_PORT: "9090"
       VANTAGE_PUBLIC_URL: ${VANTAGE_PUBLIC_URL:?VANTAGE_PUBLIC_URL is required (https://vantage.yourtailnet.ts.net)}
-      # Caddy is co-located in this compose. Trust its loopback
-      # addresses so X-Forwarded-For carries the real client IP
-      # for rate limiting and audit. Operators with a non-colocated
-      # proxy override via .env.
-      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128}
+      # Caddy is on the bridge network defined below. Containers
+      # see Caddy's IP within that subnet, NOT 127.0.0.1 (round 10
+      # finding #5). The bridge is pinned to 172.28.0.0/16 in the
+      # networks section below so this CIDR is stable.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.28.0.0/16}
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,3 +91,12 @@ volumes:
 networks:
   vaporrmm-vantage-internal:
     driver: bridge
+    # Pin the subnet so TRUSTED_PROXIES (which lists CIDRs Fiber
+    # will trust X-Forwarded-For from) is stable across deploys.
+    # Codex round 10 finding #5: the bridge's default subnet is
+    # daemon-assigned (172.17-31/16), which doesn't match the
+    # loopback CIDR earlier versions of compose set for trust.
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
