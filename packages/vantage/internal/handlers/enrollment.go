@@ -129,22 +129,47 @@ func mintEnrollmentToken(c *fiber.Ctx) error {
 	// CAS on tailscale_auth_key_id (codex round-6 sweep): the row
 	// was inserted with NULL just above. If something else races
 	// in to fill the column, the WHERE clause refuses to overwrite.
-	// Single-handler INSERT-then-UPDATE shouldn't race in practice;
-	// the CAS is defense-in-depth.
-	if _, err := db.DB.Exec(
+	//
+	// Codex round-9 #1: a SQL-level success with rowsAffected==0
+	// means the CAS predicate failed (concurrent modifier filled
+	// the column). The auth key we just minted is now orphaned —
+	// no DB row points at it. Revoke it before returning, otherwise
+	// it dangles until its 24h TTL.
+	revokeOrphanedKey := func(reason string, fields ...interface{}) {
+		args := append([]interface{}{"reason", reason, "key_id", authKey.ID, "row_id", id}, fields...)
+		slog.Error("enrollment: link failed; revoking orphaned tailscale key", args...)
+		if revokeErr := cl.RevokeAuthKey(c.UserContext(), tailnet, authKey.ID); revokeErr != nil {
+			slog.Error("enrollment: revoke orphaned key failed",
+				"error", revokeErr, "key_id", authKey.ID,
+				"note", "operator may need to revoke manually; key will expire per its 24h TTL")
+		}
+	}
+	result, err := db.DB.Exec(
 		`UPDATE enrollment_tokens SET tailscale_auth_key_id = $1 WHERE id = $2 AND tailscale_auth_key_id IS NULL`,
 		authKey.ID, id,
-	); err != nil {
-		// Compensation: revoke the Tailscale key we just minted —
-		// without this it would dangle in Tailscale with the
-		// enrollment row pointing at NULL.
-		slog.Error("enrollment: link tailscale key id", "error", err, "key_id", authKey.ID)
-		if revokeErr := cl.RevokeAuthKey(c.UserContext(), tailnet, authKey.ID); revokeErr != nil {
-			slog.Error("enrollment: failed to revoke orphaned tailscale key",
-				"error", revokeErr, "key_id", authKey.ID,
-				"note", "key will expire per its 24h TTL")
-		}
+	)
+	if err != nil {
+		revokeOrphanedKey("sql error", "error", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to link tailscale auth key"})
+	}
+	rowsAffected, raErr := result.RowsAffected()
+	if raErr != nil {
+		// Driver pathology: lib/pq always returns rowsAffected on
+		// UPDATE. If it ever doesn't we can't tell whether the link
+		// landed — revoke the key defensively.
+		revokeOrphanedKey("rowsAffected error", "error", raErr)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to verify auth key link"})
+	}
+	if rowsAffected == 0 {
+		// CAS predicate failed: the enrollment row was modified
+		// concurrently (someone else filled tailscale_auth_key_id,
+		// or the row was deleted). Our key is unrecorded in
+		// Vantage — revoke it and tell the operator to retry.
+		revokeOrphanedKey("CAS predicate miss (concurrent modification)")
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "enrollment token was modified concurrently; auth key revoked. Retry the mint.",
+			"code":  "enrollment_modified_concurrently",
+		})
 	}
 
 	// Synchronous: operator only sees the bundle after the audit

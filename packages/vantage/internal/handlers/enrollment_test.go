@@ -238,3 +238,71 @@ func TestMintEnrollmentToken_LinkUpdateFailsRevokes(t *testing.T) {
 		t.Errorf("orphaned Tailscale key should have been revoked, got %q", revoked)
 	}
 }
+
+// TestMintEnrollmentToken_CASPredicateFails_RevokesKey: codex
+// round-9 #1. Drives the CAS-miss path by hooking into the fake
+// Tailscale client's mintEnrollment — after the mint succeeds,
+// the hook directly UPDATEs the enrollment row's
+// tailscale_auth_key_id to a DIFFERENT value, simulating a
+// concurrent modifier. The handler's subsequent CAS UPDATE finds
+// 0 rows affected, revokes the orphaned key, and returns 409
+// enrollment_modified_concurrently.
+func TestMintEnrollmentToken_CASPredicateFails_RevokesKey(t *testing.T) {
+	app, swap := enrollmentEnv(t, "super_admin")
+
+	swap(&fakeTSClient{})
+	r := postJSON(t, app, "/api/v1/tailscale/connect", map[string]string{
+		"client_id": "id", "client_secret": "secret", "tailnet": "acme.ts.net",
+	})
+	r.Body.Close()
+
+	revoked := ""
+	swap(&fakeTSClient{
+		mintEnrollment: func(ctx context.Context, tn, desc string) (*tailscale.AuthKey, error) {
+			// Race window: between this mint returning and the
+			// handler running its CAS UPDATE, simulate a concurrent
+			// modifier filling tailscale_auth_key_id to a different
+			// value.
+			if _, err := db.DB.Exec(
+				`UPDATE enrollment_tokens SET tailscale_auth_key_id = 'concurrent-winner-key' WHERE tenant_id = 'tenant-cas-miss'`,
+			); err != nil {
+				t.Fatalf("simulate concurrent modify: %v", err)
+			}
+			return &tailscale.AuthKey{ID: "k-original-mint", Key: "tskey-original"}, nil
+		},
+		revokeAuthKey: func(ctx context.Context, tn, keyID string) error {
+			revoked = keyID
+			return nil
+		},
+	})
+
+	resp := postJSON(t, app, "/api/v1/vantage/enrollment-tokens", map[string]string{
+		"tenant_id": "tenant-cas-miss",
+		"notes":     "race victim",
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("expected 409 on CAS miss, got %d body=%s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "enrollment_modified_concurrently") {
+		t.Errorf("body should carry code=enrollment_modified_concurrently, got %s", body)
+	}
+
+	// Revoke must have fired with the original mint's key id, NOT
+	// the concurrent winner's key.
+	if revoked != "k-original-mint" {
+		t.Errorf("revoke must target the orphaned original mint; got %q", revoked)
+	}
+
+	// DB row preserves the concurrent winner's key (handler must
+	// not have overwritten it).
+	var stored string
+	db.DB.QueryRow(
+		`SELECT tailscale_auth_key_id FROM enrollment_tokens WHERE tenant_id = 'tenant-cas-miss'`,
+	).Scan(&stored)
+	if stored != "concurrent-winner-key" {
+		t.Errorf("CAS predicate should have refused to overwrite; expected concurrent-winner-key, got %q", stored)
+	}
+}
