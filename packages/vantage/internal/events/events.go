@@ -90,14 +90,26 @@ func AuditLogSyncTx(tx *sql.Tx, userID, action, resourceType, resourceID, detail
 		return fmt.Errorf("audit: read chain head: %w", err)
 	}
 
+	// Codex round-10 finding #3: capture the timestamp ONCE and
+	// use it for both the canonicalization (signed) and the row
+	// persistence. The previous code used time.Now().Unix() for
+	// the signature and let Postgres' DEFAULT NOW() set
+	// created_at — those two timestamps differ at second
+	// boundaries, breaking verification (a verifier reading the
+	// row gets created_at and recomputes against the signed ts).
+	//
+	// to_timestamp(BIGINT) converts Unix seconds → TIMESTAMPTZ
+	// deterministically; verification reads it back via
+	// EXTRACT(EPOCH FROM created_at)::BIGINT.
 	seq := prevSeq + 1
-	canonical := canonicalRow(seq, userID, action, resourceType, resourceID, details, ip, time.Now().Unix())
+	nowUnix := time.Now().Unix()
+	canonical := canonicalRow(seq, userID, action, resourceType, resourceID, details, ip, nowUnix)
 	signature := crypto.HMACSHA256("audit", prevSignature+"|"+canonical)
 
 	if _, err := tx.Exec(
-		`INSERT INTO audit_log (chain_seq, signature, user_id, action, resource_type, resource_id, details, ip)
-		     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		seq, signature, nullable(userID), action, resourceType, nullable(resourceID), nullable(details), nullable(ip),
+		`INSERT INTO audit_log (chain_seq, signature, user_id, action, resource_type, resource_id, details, ip, created_at)
+		     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9))`,
+		seq, signature, nullable(userID), action, resourceType, nullable(resourceID), nullable(details), nullable(ip), nowUnix,
 	); err != nil {
 		return fmt.Errorf("audit: write row: %w", err)
 	}

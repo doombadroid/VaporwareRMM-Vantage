@@ -204,3 +204,38 @@ func TestAuditLog_ChainIntegrityUnderConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditLogSync_SignedTimestampMatchesPersisted: codex round-10
+// finding #3. A verifier reads the audit_log row and recomputes
+// the signature using created_at-as-Unix-seconds. That recomputed
+// signature MUST equal the persisted signature. Previously the
+// code signed time.Now().Unix() but let Postgres' DEFAULT NOW()
+// set created_at — at second boundaries the two diverged and
+// verification failed.
+func TestAuditLogSync_SignedTimestampMatchesPersisted(t *testing.T) {
+	setupEventsTest(t)
+
+	if err := AuditLogSync("u-verify", "test.verify.action", "test", "rid-v", "detail-v", "127.0.0.1"); err != nil {
+		t.Fatalf("AuditLogSync: %v", err)
+	}
+
+	var seq int64
+	var sig string
+	var createdAtUnix int64
+	if err := db.DB.QueryRow(`
+		SELECT chain_seq, signature, EXTRACT(EPOCH FROM created_at)::BIGINT
+		FROM audit_log ORDER BY chain_seq DESC LIMIT 1
+	`).Scan(&seq, &sig, &createdAtUnix); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+
+	// Recompute signature using created_at-as-Unix to simulate a
+	// future verification CLI.
+	canonical := canonicalRow(seq, "u-verify", "test.verify.action", "test", "rid-v", "detail-v", "127.0.0.1", createdAtUnix)
+	// Genesis predecessor: previous signature is "" because this
+	// is the first row.
+	recomputed := crypto.HMACSHA256("audit", ""+"|"+canonical)
+	if recomputed != sig {
+		t.Errorf("signature verification failed:\n  stored:     %s\n  recomputed: %s\n  created_at(unix)=%d", sig, recomputed, createdAtUnix)
+	}
+}
