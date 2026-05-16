@@ -144,7 +144,21 @@ func mintEnrollmentToken(c *fiber.Ctx) error {
 				"note", "operator may need to revoke manually; key will expire per its 24h TTL")
 		}
 	}
-	result, err := db.DB.Exec(
+	// Wrap link UPDATE + audit row in a single transaction
+	// (round-11 audit Phase 5): if audit fails after the link
+	// committed, the row would be linked to a key with no
+	// trace — recoverable but ugly. Atomic commit means a failed
+	// audit ROLLBACKs the link; revoke compensates the
+	// just-minted Tailscale key; operator retries with the
+	// existing row's NULL key still NULL (CAS IS NULL passes).
+	linkTx, err := db.DB.Begin()
+	if err != nil {
+		revokeOrphanedKey("begin link tx", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to open link transaction"})
+	}
+	defer func() { _ = linkTx.Rollback() }()
+
+	result, err := linkTx.Exec(
 		`UPDATE enrollment_tokens SET tailscale_auth_key_id = $1 WHERE id = $2 AND tailscale_auth_key_id IS NULL`,
 		authKey.ID, id,
 	)
@@ -172,21 +186,27 @@ func mintEnrollmentToken(c *fiber.Ctx) error {
 		})
 	}
 
-	// Synchronous: operator only sees the bundle after the audit
-	// row is durable. Codex round-6 #2/#3: AuditLogSync now
-	// returns error. The enrollment row + Tailscale key already
-	// exist at this point (orphans on failure), so a non-nil
-	// error here surfaces a 500 but leaves a recoverable
-	// half-state — operator will retry, hit the token_hash UNIQUE
-	// constraint, and the orphan row expires per its 24h TTL.
-	if err := events.AuditLogSync(userID, "enrollment_token.mint", "enrollment_token", id,
+	// Audit inside the same tx as the link (round-11 audit
+	// Phase 5). If audit fails, the deferred Rollback reverts the
+	// link UPDATE — tailscale_auth_key_id stays NULL — so a retry
+	// can pass the IS NULL CAS again with a fresh mint.
+	if err := events.AuditLogSyncTx(linkTx, userID, "enrollment_token.mint", "enrollment_token", id,
 		fmt.Sprintf("minted enrollment token for tenant %s", req.TenantID), c.IP()); err != nil {
 		slog.Error("enrollment: audit write", "error", err, "row_id", id)
+		// Defer rollback fires; revoke the Tailscale key the link
+		// was about to commit.
+		revokeOrphanedKey("audit write failed", "error", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error":  "failed to write audit record",
 			"code":   "audit_write_failed",
 			"row_id": id,
 		})
+	}
+
+	if err := linkTx.Commit(); err != nil {
+		slog.Error("enrollment: link tx commit", "error", err, "row_id", id)
+		revokeOrphanedKey("commit failed", "error", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to commit enrollment link"})
 	}
 
 	return c.JSON(fiber.Map{
