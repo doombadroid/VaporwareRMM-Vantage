@@ -386,8 +386,32 @@ func disconnectTailscale(c *fiber.Ctx) error {
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to read connection"})
 	}
-	if _, err := db.DB.Exec(`DELETE FROM tailscale_connection WHERE id = 'singleton'`); err != nil {
+	// Compare-and-set on tailnet (codex round-10 #2): without it,
+	// a concurrent rotate that flipped the tailnet between our
+	// SELECT and DELETE would still delete the row, and the
+	// audit row below would report the OLD tailnet name. The
+	// CAS predicate refuses the delete if the row drifted.
+	result, err := db.DB.Exec(
+		`DELETE FROM tailscale_connection WHERE id = 'singleton' AND tailnet = $1`,
+		existingTailnet,
+	)
+	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete connection"})
+	}
+	rowsAffected, raErr := result.RowsAffected()
+	if raErr != nil {
+		slog.Error("tailscale: disconnect rowsAffected", "error", raErr)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to verify disconnect"})
+	}
+	if rowsAffected == 0 {
+		// Singleton drifted (concurrent rotate to a different
+		// tailnet) or was already deleted. Either way, the
+		// disconnect didn't act on what we read — surface 409 so
+		// the operator can refresh and reconsider.
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "Tailscale connection changed concurrently; refresh and retry disconnect",
+			"code":  "tailnet_changed_concurrently",
+		})
 	}
 	userID, _ := c.Locals("user_id").(string)
 	events.AuditLog(userID, "tailscale.disconnected", "tailscale_connection", "singleton",
