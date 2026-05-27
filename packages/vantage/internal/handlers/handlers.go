@@ -44,6 +44,7 @@ func RegisterAuthedRoutes(g fiber.Router) {
 	g.Get("/edges", listEdgesHandler)
 	RegisterTailscaleRoutes(g)
 	RegisterEnrollmentRoutes(g)
+	RegisterCommandRoutes(g)
 }
 
 func healthHandler(c *fiber.Ctx) error {
