@@ -134,27 +134,27 @@ func TestCommandLifecycle_AllTransitions(t *testing.T) {
 		{
 			name: "MarkDeliveredToEdge", toState: StateDeliveredToEdge,
 			legalFrom: map[string]bool{StateQueued: true}, missErr: ErrInvalidTransition,
-			apply: func(tx *sql.Tx, cid string) error { return MarkDeliveredToEdge(ctx, tx, cid) },
+			apply: func(tx *sql.Tx, cid string) error { return MarkDeliveredToEdge(ctx, tx, cid, "edge1") },
 		},
 		{
 			name: "MarkDeliveredToEndpoint", toState: StateDeliveredToEndpoint,
 			legalFrom: map[string]bool{StateDeliveredToEdge: true}, missErr: ErrInvalidTransition,
-			apply: func(tx *sql.Tx, cid string) error { return MarkDeliveredToEndpoint(ctx, tx, cid) },
+			apply: func(tx *sql.Tx, cid string) error { return MarkDeliveredToEndpoint(ctx, tx, cid, "edge1") },
 		},
 		{
 			name: "MarkExecuting", toState: StateExecuting,
 			legalFrom: map[string]bool{StateDeliveredToEndpoint: true}, missErr: ErrInvalidTransition,
-			apply: func(tx *sql.Tx, cid string) error { return MarkExecuting(ctx, tx, cid) },
+			apply: func(tx *sql.Tx, cid string) error { return MarkExecuting(ctx, tx, cid, "edge1") },
 		},
 		{
 			name: "MarkTerminal_succeeded", toState: StateSucceeded,
 			legalFrom: map[string]bool{StateDeliveredToEndpoint: true, StateExecuting: true}, missErr: ErrInvalidTransition,
-			apply: func(tx *sql.Tx, cid string) error { return MarkTerminal(ctx, tx, cid, StateSucceeded, "ok") },
+			apply: func(tx *sql.Tx, cid string) error { return MarkTerminal(ctx, tx, cid, "edge1", StateSucceeded, "ok") },
 		},
 		{
 			name: "MarkTerminal_failed", toState: StateFailed,
 			legalFrom: map[string]bool{StateDeliveredToEndpoint: true, StateExecuting: true}, missErr: ErrInvalidTransition,
-			apply: func(tx *sql.Tx, cid string) error { return MarkTerminal(ctx, tx, cid, StateFailed, "boom") },
+			apply: func(tx *sql.Tx, cid string) error { return MarkTerminal(ctx, tx, cid, "edge1", StateFailed, "boom") },
 		},
 		{
 			name: "MarkCancelled", toState: StateCancelled,
@@ -205,7 +205,7 @@ func TestMarkDeliveredToEdge_NotFound(t *testing.T) {
 	ctx := context.Background()
 	tx, _ := db.DB.BeginTx(ctx, nil)
 	defer tx.Rollback()
-	if err := MarkDeliveredToEdge(ctx, tx, "no-such-correlation"); !errors.Is(err, ErrNotFound) {
+	if err := MarkDeliveredToEdge(ctx, tx, "no-such-correlation", "edge1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
@@ -219,7 +219,7 @@ func TestMarkTerminal_RejectsBadStatus(t *testing.T) {
 	forceState(t, cid, StateExecuting)
 	tx, _ := db.DB.BeginTx(ctx, nil)
 	defer tx.Rollback()
-	if err := MarkTerminal(ctx, tx, cid, "expired", "nope"); !errors.Is(err, ErrInvalidTransition) {
+	if err := MarkTerminal(ctx, tx, cid, "edge1", "expired", "nope"); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("want ErrInvalidTransition for bad status, got %v", err)
 	}
 }

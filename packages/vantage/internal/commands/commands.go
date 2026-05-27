@@ -111,9 +111,16 @@ func EnqueueCommand(ctx context.Context, tx *sql.Tx, req EnqueueRequest) (string
 	return correlationID, nil
 }
 
+// The edge-driven transitions (MarkDeliveredToEdge / MarkDeliveredToEndpoint /
+// MarkExecuting / MarkTerminal) are EDGE-SCOPED: the CAS also requires
+// edge_id = the authenticated Edge, so one Edge can never advance or report
+// results for a command belonging to another Edge (cross-boundary safety,
+// audit phase 12). A non-owned correlation_id falls through to classifyMiss
+// (ErrInvalidTransition), which idempotent callers treat as benign.
+
 // MarkDeliveredToEdge: queued → delivered_to_edge, on Edge ack (Decision 2).
-func MarkDeliveredToEdge(ctx context.Context, tx *sql.Tx, correlationID string) error {
-	return casTransition(ctx, tx, correlationID,
+func MarkDeliveredToEdge(ctx context.Context, tx *sql.Tx, correlationID, edgeID string) error {
+	return casTransition(ctx, tx, correlationID, edgeID,
 		"state = 'delivered_to_edge', delivered_to_edge_at = $2",
 		[]string{StateQueued},
 		SystemActor, "command.delivered_to_edge", "", time.Now().Unix())
@@ -121,16 +128,16 @@ func MarkDeliveredToEdge(ctx context.Context, tx *sql.Tx, correlationID string) 
 
 // MarkDeliveredToEndpoint: delivered_to_edge → delivered_to_endpoint, when the
 // Edge reports the agent received the command (via /api/edge/events).
-func MarkDeliveredToEndpoint(ctx context.Context, tx *sql.Tx, correlationID string) error {
-	return casTransition(ctx, tx, correlationID,
+func MarkDeliveredToEndpoint(ctx context.Context, tx *sql.Tx, correlationID, edgeID string) error {
+	return casTransition(ctx, tx, correlationID, edgeID,
 		"state = 'delivered_to_endpoint', delivered_to_endpoint_at = $2",
 		[]string{StateDeliveredToEdge},
 		SystemActor, "command.delivered_to_endpoint", "", time.Now().Unix())
 }
 
 // MarkExecuting: delivered_to_endpoint → executing.
-func MarkExecuting(ctx context.Context, tx *sql.Tx, correlationID string) error {
-	return casTransition(ctx, tx, correlationID,
+func MarkExecuting(ctx context.Context, tx *sql.Tx, correlationID, edgeID string) error {
+	return casTransition(ctx, tx, correlationID, edgeID,
 		"state = 'executing'",
 		[]string{StateDeliveredToEndpoint},
 		SystemActor, "command.executing", "")
@@ -139,7 +146,7 @@ func MarkExecuting(ctx context.Context, tx *sql.Tx, correlationID string) error 
 // MarkTerminal: delivered_to_endpoint|executing → succeeded|failed. Both
 // source states are legal so fast-returning commands that never reported an
 // explicit "executing" event still terminate correctly.
-func MarkTerminal(ctx context.Context, tx *sql.Tx, correlationID, status, message string) error {
+func MarkTerminal(ctx context.Context, tx *sql.Tx, correlationID, edgeID, status, message string) error {
 	if status != StateSucceeded && status != StateFailed {
 		return fmt.Errorf("%w: terminal status must be succeeded|failed, got %q", ErrInvalidTransition, status)
 	}
@@ -147,7 +154,7 @@ func MarkTerminal(ctx context.Context, tx *sql.Tx, correlationID, status, messag
 	details, _ := json.Marshal(map[string]string{"result_status": status})
 	// state = $2 (succeeded|failed); result_status mirrors it; result_message
 	// is the brief operator-facing string ($3); terminal_at = $4.
-	return casTransition(ctx, tx, correlationID,
+	return casTransition(ctx, tx, correlationID, edgeID,
 		"state = $2, result_status = $2, result_message = $3, terminal_at = $4",
 		[]string{StateDeliveredToEndpoint, StateExecuting},
 		SystemActor, "command.terminal", string(details),
@@ -242,17 +249,18 @@ func ExpireStaleQueued(ctx context.Context) (int, error) {
 // Param layout: $1 = correlation_id, $2.. = the caller's setClause args, and
 // the fromStates array is bound LAST (placeholder $N). On exactly-one-row it
 // writes an audit entry (action/details); on zero rows it classifies the miss.
-func casTransition(ctx context.Context, tx *sql.Tx, correlationID, setClause string, fromStates []string, actorUserID, action, details string, args ...interface{}) error {
+func casTransition(ctx context.Context, tx *sql.Tx, correlationID, edgeID, setClause string, fromStates []string, actorUserID, action, details string, args ...interface{}) error {
 	// Param layout: $1 = correlation_id, $2.. = setClause args (caller's),
-	// final placeholder = fromStates array.
+	// then the fromStates array, then edge_id (the edge-scope predicate).
 	fromIdx := 2 + len(args)
+	edgeIdx := fromIdx + 1
 	query := fmt.Sprintf(
-		`UPDATE command_queue SET %s WHERE correlation_id = $1 AND state = ANY($%d)`,
-		setClause, fromIdx)
-	allArgs := make([]interface{}, 0, 2+len(args))
+		`UPDATE command_queue SET %s WHERE correlation_id = $1 AND state = ANY($%d) AND edge_id = $%d`,
+		setClause, fromIdx, edgeIdx)
+	allArgs := make([]interface{}, 0, 3+len(args))
 	allArgs = append(allArgs, correlationID)
 	allArgs = append(allArgs, args...)
-	allArgs = append(allArgs, pq.Array(fromStates))
+	allArgs = append(allArgs, pq.Array(fromStates), edgeID)
 
 	res, err := tx.ExecContext(ctx, query, allArgs...)
 	if err != nil {

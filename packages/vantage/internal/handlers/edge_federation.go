@@ -112,7 +112,8 @@ func RegisterEdgeRoutes(app *fiber.App) {
 	authed := app.Group("/api/edge", auth.EdgeAuthMiddleware())
 	authed.Post("/poll", pollEdge)
 	authed.Post("/events", postEdgeEvents)
-	authed.Post("/tags/sync", postEdgeTagsSync) // F4a tag metadata mirror
+	authed.Post("/tags/sync", postEdgeTagsSync)       // F4a tag metadata mirror
+	authed.Post("/commands/ack", postEdgeCommandsAck) // F4a command delivery ack
 }
 
 // maxEventsPerBatch caps a single /api/edge/events request. F4's
@@ -220,30 +221,32 @@ func postEdgeEvents(c *fiber.Ctx) error {
 //     F4). Shape is locked so F4 just populates the slice.
 //
 // Atomic rotation contract (F3 implementer note):
-//   When the response carries new_edge_token, the old token is
-//   already dead. The Edge MUST persist the new token (atomic
-//   write — e.g., write to token.new, fsync, rename to token)
-//   before issuing any subsequent request. If the persist fails
-//   or the response is lost mid-flight, the Edge will see 401 on
-//   the next request and must fall back to re-enrollment via the
-//   operator-issued bundle. No grace window — the simpler
-//   contract closes a race where an attacker who captured the
-//   old token could use it during a rotation overlap.
+//
+//	When the response carries new_edge_token, the old token is
+//	already dead. The Edge MUST persist the new token (atomic
+//	write — e.g., write to token.new, fsync, rename to token)
+//	before issuing any subsequent request. If the persist fails
+//	or the response is lost mid-flight, the Edge will see 401 on
+//	the next request and must fall back to re-enrollment via the
+//	operator-issued bundle. No grace window — the simpler
+//	contract closes a race where an attacker who captured the
+//	old token could use it during a rotation overlap.
+//
 // pollEdge is structured around four strict phases (codex round-5
 // #1/#2):
 //
-//   Phase 1: parse + validate the request body. No state mutation.
-//   Phase 2: read failure-prone external state (Vantage chain
-//            head). No state mutation; failures here return 500
-//            with old state intact.
-//   Phase 3: single transaction wraps every mutation — rotation
-//            check, rotation UPDATE (if window), edge_version
-//            UPDATE, audit_checkpoints INSERT. COMMIT is the last
-//            act. If anything before commit fails, rollback
-//            restores the pre-handler state and Edge can retry
-//            with the same token.
-//   Phase 4: build + return response. Past commit, no failure
-//            path can lose the rotation.
+//	Phase 1: parse + validate the request body. No state mutation.
+//	Phase 2: read failure-prone external state (Vantage chain
+//	         head). No state mutation; failures here return 500
+//	         with old state intact.
+//	Phase 3: single transaction wraps every mutation — rotation
+//	         check, rotation UPDATE (if window), edge_version
+//	         UPDATE, audit_checkpoints INSERT. COMMIT is the last
+//	         act. If anything before commit fails, rollback
+//	         restores the pre-handler state and Edge can retry
+//	         with the same token.
+//	Phase 4: build + return response. Past commit, no failure
+//	         path can lose the rotation.
 //
 // Failure surface that remains: TCP reset between commit and
 // client-side receive. Edge will see no response, retry with old
@@ -401,13 +404,23 @@ func pollEdge(c *fiber.Ctx) error {
 	}
 
 	// ---- Phase 4: response ----
+	// Pending commands for this Edge (F4a). Read AFTER commit: poll never
+	// mutates command state (that happens on ack), so a committed read is
+	// correct and avoids holding the edges-row lock across the scan. A read
+	// error here must NOT fail the poll — the token rotation is already
+	// durable; degrade to an empty command set and the Edge retries next poll.
+	pendingCommands, cerr := fetchPendingCommands(edgeID, nowUnix)
+	if cerr != nil {
+		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
+		pendingCommands = []pollCommandDTO{}
+	}
 	resp := fiber.Map{
 		"vantage_version": "0.1.0",
 		"audit_chain_head": fiber.Map{
 			"seq":       vantageSeq,
 			"signature": vantageSig,
 		},
-		"commands":                  json.RawMessage("[]"),
+		"commands":                  pendingCommands,
 		"next_poll_after_seconds":   defaultPollIntervalSeconds,
 		"min_required_edge_version": minimum,
 	}
@@ -660,4 +673,3 @@ func generateEdgeToken() (string, error) {
 	}
 	return edgeTokenPrefix + base64.RawURLEncoding.EncodeToString(b), nil
 }
-
