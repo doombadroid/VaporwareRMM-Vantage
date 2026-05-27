@@ -148,17 +148,17 @@ func TestCommandLifecycle_AllTransitions(t *testing.T) {
 		},
 		{
 			name: "MarkTerminal_succeeded", toState: StateSucceeded,
-			legalFrom: map[string]bool{StateDeliveredToEndpoint: true, StateExecuting: true}, missErr: ErrInvalidTransition,
+			legalFrom: map[string]bool{StateQueued: true, StateDeliveredToEdge: true, StateDeliveredToEndpoint: true, StateExecuting: true}, missErr: ErrInvalidTransition,
 			apply: func(tx *sql.Tx, cid string) error { return MarkTerminal(ctx, tx, cid, "edge1", StateSucceeded, "ok") },
 		},
 		{
 			name: "MarkTerminal_failed", toState: StateFailed,
-			legalFrom: map[string]bool{StateDeliveredToEndpoint: true, StateExecuting: true}, missErr: ErrInvalidTransition,
+			legalFrom: map[string]bool{StateQueued: true, StateDeliveredToEdge: true, StateDeliveredToEndpoint: true, StateExecuting: true}, missErr: ErrInvalidTransition,
 			apply: func(tx *sql.Tx, cid string) error { return MarkTerminal(ctx, tx, cid, "edge1", StateFailed, "boom") },
 		},
 		{
 			name: "MarkCancelled", toState: StateCancelled,
-			legalFrom: map[string]bool{StateQueued: true, StateDeliveredToEdge: true}, missErr: ErrNotCancellable,
+			legalFrom: map[string]bool{StateQueued: true}, missErr: ErrNotCancellable,
 			apply: func(tx *sql.Tx, cid string) error { return MarkCancelled(ctx, tx, cid, "op1") },
 		},
 	}

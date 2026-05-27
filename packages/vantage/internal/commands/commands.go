@@ -158,9 +158,16 @@ func MarkExecuting(ctx context.Context, tx *sql.Tx, correlationID, edgeID string
 		SystemActor, "command.executing", "")
 }
 
-// MarkTerminal: delivered_to_endpoint|executing → succeeded|failed. Both
-// source states are legal so fast-returning commands that never reported an
-// explicit "executing" event still terminate correctly.
+// MarkTerminal: any non-terminal state → succeeded|failed. A terminal result
+// is AUTHORITATIVE — the agent actually ran the command — so it is legal from
+// every live state (queued/delivered_to_edge/delivered_to_endpoint/executing),
+// not just the "expected" predecessors. The intermediate progress events
+// (delivered_to_endpoint, executing) are hints that can arrive late, out of
+// order across retried Edge event batches, or not at all; if the terminal
+// result were only legal from those, an out-of-order or lost progress event
+// would strand the command in a non-terminal state with its result silently
+// dropped (codex round 1 #1). Terminal states stay sinks (a result for an
+// already-terminal command is a benign idempotent no-op via classifyMiss).
 func MarkTerminal(ctx context.Context, tx *sql.Tx, correlationID, edgeID, status, message string) error {
 	if status != StateSucceeded && status != StateFailed {
 		return fmt.Errorf("%w: terminal status must be succeeded|failed, got %q", ErrInvalidTransition, status)
@@ -171,22 +178,31 @@ func MarkTerminal(ctx context.Context, tx *sql.Tx, correlationID, edgeID, status
 	// is the brief operator-facing string ($3); terminal_at = $4.
 	return casTransition(ctx, tx, correlationID, edgeID,
 		"state = $2, result_status = $2, result_message = $3, terminal_at = $4",
-		[]string{StateDeliveredToEndpoint, StateExecuting},
+		[]string{StateQueued, StateDeliveredToEdge, StateDeliveredToEndpoint, StateExecuting},
 		SystemActor, "command.terminal", string(details),
 		status, message, now)
 }
 
-// MarkCancelled: queued|delivered_to_edge → cancelled (Decision 6 — refuse
-// once delivered_to_endpoint or later). actorUserID is the operator.
-// Returns ErrNotCancellable if the command is past the cancellable window,
+// MarkCancelled: queued → cancelled only. actorUserID is the operator.
+// Returns ErrNotCancellable once the command is delivered_to_edge or later,
 // ErrNotFound if it doesn't exist.
+//
+// F4a scope (codex round 1 #4): cancellation is restricted to `queued` — a
+// command the Edge has not yet acked. Decision 6's wider window (cancel before
+// delivered_to_endpoint, i.e. including delivered_to_edge) is unsafe in F4a
+// because there is no Vantage→Edge cancel signal: once the Edge acks
+// (delivered_to_edge) it has persisted the command locally and will dispatch
+// it, so marking it cancelled at Vantage while the Edge still runs it produces
+// divergent state (and the authoritative result would then land on a
+// "cancelled" row). Widening to delivered_to_edge needs F4b to deliver
+// cancellations (e.g. via poll) and drop them before dispatch — deferred.
 func MarkCancelled(ctx context.Context, tx *sql.Tx, correlationID, actorUserID string) error {
 	now := time.Now().Unix()
 	res, err := tx.ExecContext(ctx, `
 		UPDATE command_queue
 		SET state = 'cancelled', result_status = 'cancelled',
 			result_message = 'cancelled by operator', terminal_at = $2
-		WHERE correlation_id = $1 AND state IN ('queued', 'delivered_to_edge')`,
+		WHERE correlation_id = $1 AND state = 'queued'`,
 		correlationID, now)
 	if err != nil {
 		return fmt.Errorf("commands: cancel: %w", err)
