@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"vaporrmm/vantage/internal/auth"
+	"vaporrmm/vantage/internal/commands"
 	"vaporrmm/vantage/internal/db"
 	"vaporrmm/vantage/internal/events"
 
@@ -121,12 +122,17 @@ func RegisterEdgeRoutes(app *fiber.App) {
 // cycle; 100 is generous headroom without enabling DoS.
 const maxEventsPerBatch = 100
 
-// knownEventTypes is the F2 allowlist. F4 will extend.
+// knownEventTypes is the accepted event-type allowlist. F2 types are
+// observational (logged / stored later). The "command.*" types (F4a) drive
+// the command lifecycle state machine — they transition command_queue rows.
 var knownEventTypes = map[string]bool{
-	"heartbeat":         true,
-	"alert":             true,
-	"command_result":    true,
-	"inventory_summary": true,
+	"heartbeat":                     true,
+	"alert":                         true,
+	"command_result":                true, // F2 stub name; superseded by command.result
+	"inventory_summary":             true,
+	"command.delivered_to_endpoint": true, // F4a: agent received the command
+	"command.executing":             true, // F4a: agent started executing
+	"command.result":                true, // F4a: terminal result (succeeded|failed)
 }
 
 // postEdgeEvents accepts a batch of out-of-band events from Edge.
@@ -177,6 +183,23 @@ func postEdgeEvents(c *fiber.Ctx) error {
 	}
 	rejected := []rejection{}
 	accepted := 0
+
+	// command.* events transition command_queue rows; apply them in one
+	// transaction (Pattern 4). Each transition is edge-scoped and idempotent
+	// in the commands package: an already-advanced/terminal/not-owned
+	// correlation_id is a benign no-op (the event is still "accepted" — the
+	// Edge shouldn't retry), while a real DB error fails the whole batch so
+	// the Edge retries (correlation_id keeps it idempotent). The audit
+	// checkpoint above is independent cross-attestation and stays in its own
+	// write; rolling it back on a command-tx error would lose attestation
+	// the Edge already proved.
+	ctx := c.UserContext()
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "transaction begin failed"})
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	for _, e := range req.Events {
 		if !knownEventTypes[e.Type] {
 			rejected = append(rejected, rejection{
@@ -185,17 +208,41 @@ func postEdgeEvents(c *fiber.Ctx) error {
 			})
 			continue
 		}
-		// F2 stub-handling: heartbeats are already implicitly
-		// observed via last_seen_at in EdgeAuthMiddleware. The
-		// other three types are logged for now and stored by F4
-		// when the aggregates table lands.
-		slog.Info("edge event",
-			"edge_id", edgeID,
-			"type", e.Type,
-			"correlation_id", e.CorrelationID,
-			"occurred_at", e.OccurredAt,
-		)
+		switch e.Type {
+		case "command.delivered_to_endpoint":
+			if hardErr := tolerateBenign(commands.MarkDeliveredToEndpoint(ctx, tx, e.CorrelationID, edgeID)); hardErr != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "command transition failed"})
+			}
+		case "command.executing":
+			if hardErr := tolerateBenign(commands.MarkExecuting(ctx, tx, e.CorrelationID, edgeID)); hardErr != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "command transition failed"})
+			}
+		case "command.result":
+			var p struct {
+				Status  string `json:"status"`
+				Message string `json:"message"`
+			}
+			if jerr := json.Unmarshal(e.Payload, &p); jerr != nil || (p.Status != commands.StateSucceeded && p.Status != commands.StateFailed) {
+				rejected = append(rejected, rejection{
+					CorrelationID: e.CorrelationID,
+					Reason:        "command.result payload must carry status succeeded|failed",
+				})
+				continue
+			}
+			if hardErr := tolerateBenign(commands.MarkTerminal(ctx, tx, e.CorrelationID, edgeID, p.Status, p.Message)); hardErr != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "command transition failed"})
+			}
+		default:
+			// F2 observational types (heartbeat/alert/inventory_summary/
+			// command_result stub): logged now, stored when the aggregates
+			// table lands. Heartbeats are also observed via last_seen_at.
+			slog.Info("edge event", "edge_id", edgeID, "type", e.Type, "correlation_id", e.CorrelationID, "occurred_at", e.OccurredAt)
+		}
 		accepted++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "commit failed"})
 	}
 
 	events.AuditLog("", "edge.events.batch", "edge", edgeID,
@@ -205,6 +252,18 @@ func postEdgeEvents(c *fiber.Ctx) error {
 		"accepted": accepted,
 		"rejected": rejected,
 	})
+}
+
+// tolerateBenign maps command-transition outcomes for the events handler:
+// success and idempotent no-ops (ErrInvalidTransition — already advanced /
+// not owned by this Edge; ErrNotFound — gone) return nil so the batch
+// proceeds; a real error is returned so the caller fails the batch (the Edge
+// retries, idempotent via correlation_id).
+func tolerateBenign(err error) error {
+	if err == nil || errors.Is(err, commands.ErrInvalidTransition) || errors.Is(err, commands.ErrNotFound) {
+		return nil
+	}
+	return err
 }
 
 // pollEdge handles /api/edge/poll. Issue #22 Q1 + Q5 + Q6 + Q9:

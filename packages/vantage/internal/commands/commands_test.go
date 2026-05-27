@@ -198,6 +198,21 @@ func TestCommandLifecycle_AllTransitions(t *testing.T) {
 	}
 }
 
+// TestRunExpirySweeper_StopsOnContextCancel: the sweeper goroutine returns
+// promptly when its context is cancelled (server-shutdown path). No DB needed
+// — the ticker won't fire before the cancelled context is observed.
+func TestRunExpirySweeper_StopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { RunExpirySweeper(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunExpirySweeper did not return after context cancel")
+	}
+}
+
 // TestMarkDeliveredToEdge_NotFound: a correlation_id with no row yields
 // ErrNotFound (the ack endpoint tolerates this; here we assert the sentinel).
 func TestMarkDeliveredToEdge_NotFound(t *testing.T) {

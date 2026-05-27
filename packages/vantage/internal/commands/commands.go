@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"vaporrmm/vantage/internal/db"
@@ -58,6 +59,9 @@ const SystemActor = "system"
 // TTLSeconds is the queued-without-delivery lifetime (Decision 5). After it
 // elapses the sweeper expires the command with reason "edge_unreachable".
 const TTLSeconds = 3600
+
+// SweepInterval is how often RunExpirySweeper runs the TTL sweep.
+const SweepInterval = 60 * time.Second
 
 // ExpireReason is the result_message for TTL-expired commands.
 const ExpireReason = "edge_unreachable"
@@ -239,6 +243,32 @@ func ExpireStaleQueued(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("commands: expire: commit: %w", err)
 	}
 	return len(expired), nil
+}
+
+// RunExpirySweeper runs the TTL sweep on a ticker until ctx is cancelled
+// (wired to server shutdown in main, per the F3 "goroutines respect
+// shutdown" lesson). It is safe to run on EVERY Vantage instance:
+// ExpireStaleQueued is a single atomic CAS UPDATE, so concurrent instances
+// never double-expire or double-audit a command (multi-node invariant) — at
+// worst they do redundant scans. Does NOT assume single-instance.
+func RunExpirySweeper(ctx context.Context) {
+	ticker := time.NewTicker(SweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := ExpireStaleQueued(ctx)
+			if err != nil {
+				slog.Error("command TTL sweep failed", "error", err)
+				continue
+			}
+			if n > 0 {
+				slog.Info("command TTL sweep expired commands", "count", n)
+			}
+		}
+	}
 }
 
 // casTransition is the shared compare-and-set core. It assembles
