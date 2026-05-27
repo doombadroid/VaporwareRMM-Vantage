@@ -112,6 +112,7 @@ func RegisterEdgeRoutes(app *fiber.App) {
 	authed := app.Group("/api/edge", auth.EdgeAuthMiddleware())
 	authed.Post("/poll", pollEdge)
 	authed.Post("/events", postEdgeEvents)
+	authed.Post("/tags/sync", postEdgeTagsSync) // F4a tag metadata mirror
 }
 
 // maxEventsPerBatch caps a single /api/edge/events request. F4's
