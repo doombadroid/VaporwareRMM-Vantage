@@ -15,6 +15,17 @@
 //
 // succeeded/failed/expired/cancelled are terminal sinks (no transitions out).
 //
+// KNOWN LIMITATION (audit phase 11 — stuck states): only the `queued` state
+// has a TTL (the sweeper). Once a command leaves `queued`, nothing on the
+// Vantage side times it out: if the Edge acks (delivered_to_edge) or the
+// agent receives it (delivered_to_endpoint) or starts running it (executing)
+// but never reports a terminal result, the command parks in that state
+// indefinitely. F4 ships without an execution timeout because the timeout
+// budget depends on command semantics the Edge owns (restart_service is fast,
+// but later command types may legitimately run for minutes). Proposed F4
+// follow-up: an Edge-reported execution deadline + a Vantage sweep that fails
+// commands stuck past delivered_to_endpoint for too long.
+//
 // Every transition is compare-and-set: UPDATE ... WHERE correlation_id = $1
 // AND state IN (<legal predecessors>). RowsAffected == 1 means we won the
 // transition and we write an audited chain entry in the SAME transaction;
