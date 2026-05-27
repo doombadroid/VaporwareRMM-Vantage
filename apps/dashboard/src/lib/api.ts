@@ -58,3 +58,32 @@ export type User = {
   role: string;
   last_login_at?: number;
 };
+
+// Command mirrors the CommandRow JSON from GET /api/v1/commands. result_message
+// is the brief operator-facing string; endpoint output stays on the Edge (Q4).
+export type Command = {
+  correlation_id: string;
+  edge_id: string;
+  tenant_id: string;
+  target_endpoint_id: string;
+  command_type: string;
+  state: string;
+  result_status?: string;
+  result_message?: string;
+  queued_at: number;
+  delivered_to_edge_at?: number;
+  delivered_to_endpoint_at?: number;
+  terminal_at?: number;
+  expires_at: number;
+};
+
+export type CommandList = {
+  data: Command[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+};
+
+// States from which a command can still be cancelled (Decision 6).
+export const CANCELLABLE_STATES = ["queued", "delivered_to_edge"];
