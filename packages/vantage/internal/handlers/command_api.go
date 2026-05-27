@@ -81,12 +81,21 @@ func enqueueCommandsHandler(c *fiber.Ctx) error {
 	}
 
 	// ---- Phase 2: reads (validate edge, expand targets) ----
-	var edgeTenant string
-	switch err := db.DB.QueryRow(`SELECT tenant_id FROM edges WHERE id = $1`, req.EdgeID).Scan(&edgeTenant); {
+	var edgeTenant, edgeStatus string
+	switch err := db.DB.QueryRow(`SELECT tenant_id, status FROM edges WHERE id = $1`, req.EdgeID).Scan(&edgeTenant, &edgeStatus); {
 	case errors.Is(err, sql.ErrNoRows):
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "edge not found"})
 	case err != nil:
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "edge lookup failed"})
+	}
+	// Only an active edge polls (EdgeAuthMiddleware). Queuing to a pending/
+	// unpaired/decommissioned edge would strand commands until they
+	// TTL-expire as edge_unreachable; fail fast instead (codex round 1 #2).
+	if edgeStatus != "active" {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "edge is not active (status=" + edgeStatus + "); commands can only be queued to an active edge",
+			"code":  "edge_not_active",
+		})
 	}
 
 	endpointIDs, err := expandTargets(req.EdgeID, req.Targets.Kind, req.Targets.Values)

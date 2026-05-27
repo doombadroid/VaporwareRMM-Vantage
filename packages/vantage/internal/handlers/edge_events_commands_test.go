@@ -78,6 +78,26 @@ func TestEventsCommandLifecycle(t *testing.T) {
 	}
 }
 
+// TestEventsCommandResult_OutOfOrderFromDeliveredToEdge: a command.result that
+// arrives before the delivered_to_endpoint/executing progress events (out of
+// order / lost progress) must still terminate the command — the result is
+// authoritative (round 1 #1), not dropped as a benign no-op.
+func TestEventsCommandResult_OutOfOrderFromDeliveredToEdge(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", 25*24*time.Hour)
+	seedQueuedCommand(t, "cid-ooo", "tenant-x", "edge-1", "host-a", time.Now().Unix()+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='delivered_to_edge' WHERE correlation_id='cid-ooo'`)
+
+	r := postEdgeEventsHTTP(t, app, tok, eventsBody(1, map[string]interface{}{
+		"correlation_id": "cid-ooo", "type": "command.result", "occurred_at": time.Now().Unix(),
+		"payload": map[string]string{"status": "succeeded", "message": "fast path"},
+	}))
+	r.Body.Close()
+	if s, rs, _ := cmdResult(t, "cid-ooo"); s != "succeeded" || rs != "succeeded" {
+		t.Errorf("out-of-order result from delivered_to_edge: (state=%s, result=%s), want succeeded (authoritative)", s, rs)
+	}
+}
+
 // TestEventsCommandResult_Failed exercises the failed terminal path.
 func TestEventsCommandResult_Failed(t *testing.T) {
 	app := edgeFederationEnv(t)

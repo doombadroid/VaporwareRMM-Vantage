@@ -112,6 +112,34 @@ func TestPoll_ExcludesExpiredCommands(t *testing.T) {
 	}
 }
 
+// TestPoll_RedeliversDeliveredToEdgePastTTL: a delivered_to_edge command whose
+// queued TTL has lapsed must still be re-polled (round 1 #3) so an Edge that
+// crashed before dispatch can recover it, rather than stranding it forever.
+func TestPoll_RedeliversDeliveredToEdgePastTTL(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	seedQueuedCommand(t, "cid-acked", "tenant-x", "edge-1", "host-a", time.Now().Unix()-10) // expires_at in past
+	db.DB.Exec(`UPDATE command_queue SET state='delivered_to_edge' WHERE correlation_id='cid-acked'`)
+
+	resp := postEdgePoll(t, app, tok, pollBody())
+	defer resp.Body.Close()
+	var out struct {
+		Commands []struct {
+			CorrelationID string `json:"correlation_id"`
+		} `json:"commands"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	found := false
+	for _, c := range out.Commands {
+		if c.CorrelationID == "cid-acked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("delivered_to_edge command past TTL was not re-polled (would strand on Edge crash)")
+	}
+}
+
 func TestCommandsAck_TransitionsAndIsIdempotent(t *testing.T) {
 	app := edgeFederationEnv(t)
 	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)

@@ -145,18 +145,18 @@ func currentUserHandler(c *fiber.Ctx) error {
 // returned exactly once at registration and the hash is for
 // server-side lookup only.
 type Edge struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	TenantID        string `json:"tenant_id"`
-	Status          string `json:"status"`
-	TailnetIP       string `json:"tailnet_ip,omitempty"`
-	TailnetIdentity string `json:"tailnet_identity,omitempty"`
-	EdgeVersion     string `json:"edge_version,omitempty"`
-	LastSeenAt      int64  `json:"last_seen_at,omitempty"`
-	TokenExpiresAt  int64  `json:"token_expires_at,omitempty"`
-	CreatedAt       int64  `json:"created_at"`
-	DecommissionedAt int64 `json:"decommissioned_at,omitempty"`
-	OperatorNotes   string `json:"operator_notes,omitempty"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	TenantID         string `json:"tenant_id"`
+	Status           string `json:"status"`
+	TailnetIP        string `json:"tailnet_ip,omitempty"`
+	TailnetIdentity  string `json:"tailnet_identity,omitempty"`
+	EdgeVersion      string `json:"edge_version,omitempty"`
+	LastSeenAt       int64  `json:"last_seen_at,omitempty"`
+	TokenExpiresAt   int64  `json:"token_expires_at,omitempty"`
+	CreatedAt        int64  `json:"created_at"`
+	DecommissionedAt int64  `json:"decommissioned_at,omitempty"`
+	OperatorNotes    string `json:"operator_notes,omitempty"`
 }
 
 func listEdgesHandler(c *fiber.Ctx) error {

@@ -37,14 +37,19 @@ type pollCommandDTO struct {
 // idempotency; the Edge dedupes on correlation_id). State does NOT change on
 // poll; the queued->delivered_to_edge transition happens on ACK (Decision 2).
 //
-// Only non-expired commands (expires_at > now) are returned, matching the TTL
-// sweep's CAS predicate (state='queued' AND expires_at <= now) so a command
-// can't be both delivered and expired in the same instant (audit phase 13).
+// The TTL filter (expires_at > now) applies ONLY to queued rows — it mirrors
+// the sweep's CAS predicate (state='queued' AND expires_at <= now) so a queued
+// command can't be both delivered and expired in the same instant (audit phase
+// 13). delivered_to_edge rows are ALWAYS re-pollable regardless of expires_at:
+// the queued TTL doesn't apply once the Edge has acked, and re-delivering lets
+// an Edge that lost its local copy (crash before dispatch) recover the command
+// rather than strand it forever (codex round 1 #3).
 func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error) {
 	rows, err := db.DB.Query(`
 		SELECT correlation_id, target_endpoint_id, command_type, command_params
 		FROM command_queue
-		WHERE edge_id = $1 AND state IN ('queued', 'delivered_to_edge') AND expires_at > $2
+		WHERE edge_id = $1
+		  AND ( (state = 'queued' AND expires_at > $2) OR state = 'delivered_to_edge' )
 		ORDER BY queued_at ASC
 		LIMIT 50`, edgeID, nowUnix)
 	if err != nil {

@@ -24,15 +24,15 @@ import (
 // TestFederationF2_FullFlow exercises the F2 surface end to end
 // against a real Postgres + a fake Tailscale client:
 //
-//   1. Operator (stamped super-admin) connects Tailscale
-//   2. Operator mints an enrollment bundle
-//   3. Fake Edge registers with that bundle's enrollment_token
-//   4. Fake Edge polls — gets vantage_chain_head, commands=[]
-//   5. Fake Edge pushes an events batch
-//   6. Token rotation: simulate expiry within 7-day window,
-//      poll again, expect new_edge_token + DB row updated
-//   7. Version refusal: poll with edge_version below minimum,
-//      expect 426
+//  1. Operator (stamped super-admin) connects Tailscale
+//  2. Operator mints an enrollment bundle
+//  3. Fake Edge registers with that bundle's enrollment_token
+//  4. Fake Edge polls — gets vantage_chain_head, commands=[]
+//  5. Fake Edge pushes an events batch
+//  6. Token rotation: simulate expiry within 7-day window,
+//     poll again, expect new_edge_token + DB row updated
+//  7. Version refusal: poll with edge_version below minimum,
+//     expect 426
 //
 // After this test passes, a "fake Edge" implemented purely with
 // curl against a Vantage process can drive the full F2 lifecycle.

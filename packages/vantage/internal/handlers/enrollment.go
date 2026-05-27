@@ -236,4 +236,3 @@ func nullableString(s string) interface{} {
 	}
 	return s
 }
-

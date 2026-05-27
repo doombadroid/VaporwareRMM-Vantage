@@ -213,6 +213,42 @@ func TestEnqueue_RequiresSuperAdmin_403(t *testing.T) {
 	}
 }
 
+func TestEnqueue_InactiveEdge_409(t *testing.T) {
+	app := commandAPIEnv(t, "super_admin")
+	seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	db.DB.Exec(`UPDATE edges SET status='unpaired' WHERE id='edge-1'`)
+	resp := doCmd(t, app, http.MethodPost, "/api/v1/commands", map[string]any{
+		"edge_id": "edge-1", "targets": map[string]any{"kind": "endpoint", "values": []string{"h1"}},
+		"command_type": "restart_service", "command_params": map[string]any{"service_name": "nginx"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != 409 {
+		t.Errorf("enqueue to inactive edge: status=%d, want 409", resp.StatusCode)
+	}
+}
+
+func TestCancel_DeliveredToEdge_409(t *testing.T) {
+	app := commandAPIEnv(t, "super_admin")
+	seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	resp := doCmd(t, app, http.MethodPost, "/api/v1/commands", map[string]any{
+		"edge_id": "edge-1", "targets": map[string]any{"kind": "endpoint", "values": []string{"h1"}},
+		"command_type": "restart_service", "command_params": map[string]any{"service_name": "nginx"},
+	})
+	var enq struct {
+		CorrelationIDs []string `json:"correlation_ids"`
+	}
+	json.NewDecoder(resp.Body).Decode(&enq)
+	resp.Body.Close()
+	cid := enq.CorrelationIDs[0]
+	// Edge acked it (delivered_to_edge) — now no longer cancellable (round 1 #4).
+	db.DB.Exec(`UPDATE command_queue SET state='delivered_to_edge' WHERE correlation_id=$1`, cid)
+	c := doCmd(t, app, http.MethodDelete, "/api/v1/commands/"+cid, nil)
+	defer c.Body.Close()
+	if c.StatusCode != 409 {
+		t.Errorf("cancel delivered_to_edge: status=%d, want 409 (queued-only cancel)", c.StatusCode)
+	}
+}
+
 func TestCancel_QueuedSucceeds_DispatchedConflicts(t *testing.T) {
 	app := commandAPIEnv(t, "super_admin")
 	seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
