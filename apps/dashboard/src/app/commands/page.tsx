@@ -51,8 +51,10 @@ export default function CommandsPage() {
   }, [load]);
 
   useEffect(() => {
+    // limit=200 (the backend's max page) so the filter + modal cover fleets
+    // larger than the default 50-edge page (codex round 2 #4).
     api
-      .get<EdgeList>("/edges")
+      .get<EdgeList>("/edges?limit=200")
       .then((r) => setEdges(r.data.data.map((e) => ({ id: e.id, name: e.name || e.id }))))
       .catch(() => {
         /* edge dropdown is best-effort; filtering still works by typing */
@@ -203,6 +205,13 @@ function NewCommandModal({
   const [targetValue, setTargetValue] = useState("");
   const [serviceName, setServiceName] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  // /edges may resolve after the modal mounts; adopt the first edge once it
+  // arrives if the operator hasn't picked one, so the visible selection and
+  // edgeID agree (codex round 2 #3).
+  useEffect(() => {
+    if (!edgeID && edges.length > 0) setEdgeID(edges[0].id);
+  }, [edges, edgeID]);
 
   const submit = async () => {
     if (!edgeID || !targetValue || !serviceName) {

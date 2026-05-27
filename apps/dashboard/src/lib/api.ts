@@ -85,5 +85,8 @@ export type CommandList = {
   has_more: boolean;
 };
 
-// States from which a command can still be cancelled (Decision 6).
-export const CANCELLABLE_STATES = ["queued", "delivered_to_edge"];
+// States from which a command can still be cancelled. F4a allows cancel only
+// while `queued` (the backend MarkCancelled is queued-only — once the Edge
+// acks, cancellation needs an Edge-side signal that lands in F4b). Showing
+// Cancel for delivered_to_edge would render an action that always 409s.
+export const CANCELLABLE_STATES = ["queued"];
