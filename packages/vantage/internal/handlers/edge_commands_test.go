@@ -140,6 +140,62 @@ func TestPoll_RedeliversDeliveredToEdgePastTTL(t *testing.T) {
 	}
 }
 
+// TestPoll_ExcludesQueuedWithinAckGrace: a queued command whose TTL is within
+// ackGraceSeconds of expiry is NOT delivered (round 2 #1), so it can't be
+// handed out and then expired before its ack lands.
+func TestPoll_ExcludesQueuedWithinAckGrace(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	seedQueuedCommand(t, "cid-soon", "tenant-x", "edge-1", "host-a", now+30)  // within 60s grace → excluded
+	seedQueuedCommand(t, "cid-far", "tenant-x", "edge-1", "host-b", now+3600) // ample TTL → delivered
+
+	resp := postEdgePoll(t, app, tok, pollBody())
+	defer resp.Body.Close()
+	var out struct {
+		Commands []struct {
+			CorrelationID string `json:"correlation_id"`
+		} `json:"commands"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	got := map[string]bool{}
+	for _, c := range out.Commands {
+		got[c.CorrelationID] = true
+	}
+	if got["cid-soon"] {
+		t.Error("delivered a queued command within the ack-grace window (could expire before ack)")
+	}
+	if !got["cid-far"] {
+		t.Error("did not deliver a queued command with ample TTL")
+	}
+}
+
+// TestPoll_QueuedOrderedBeforeRedeliveries: queued commands are delivered ahead
+// of delivered_to_edge redeliveries even when the redelivery is older, so a
+// backlog of stuck redeliveries can't starve new commands (round 2 #5).
+func TestPoll_QueuedOrderedBeforeRedeliveries(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	// An OLDER delivered_to_edge redelivery (earlier queued_at).
+	seedQueuedCommand(t, "cid-old-delivered", "tenant-x", "edge-1", "host-a", now+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='delivered_to_edge', queued_at=$1 WHERE correlation_id='cid-old-delivered'`, now-100)
+	// A NEWER queued command.
+	seedQueuedCommand(t, "cid-new-queued", "tenant-x", "edge-1", "host-b", now+3600)
+
+	resp := postEdgePoll(t, app, tok, pollBody())
+	defer resp.Body.Close()
+	var out struct {
+		Commands []struct {
+			CorrelationID string `json:"correlation_id"`
+		} `json:"commands"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if len(out.Commands) < 1 || out.Commands[0].CorrelationID != "cid-new-queued" {
+		t.Errorf("queued command not ordered first; got %+v", out.Commands)
+	}
+}
+
 func TestCommandsAck_TransitionsAndIsIdempotent(t *testing.T) {
 	app := edgeFederationEnv(t)
 	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)

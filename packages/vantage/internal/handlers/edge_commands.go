@@ -24,6 +24,20 @@ import (
 // 500 is generous headroom while still bounding the transaction.
 const maxAckBatch = 500
 
+// ackGraceSeconds is the TTL margin a queued command must have left before
+// poll will deliver it. It closes the deliver-then-expire race (codex round 2
+// #1): a command delivered in a poll response is still `queued`, and the TTL
+// sweeper expires `queued` rows past expires_at — so a command handed out just
+// before expiry could be marked expired before its ack arrives, after which
+// the Edge runs it but the result lands on a terminal `expired` row and is
+// dropped. By refusing to deliver a queued command within ackGraceSeconds of
+// expiry, any delivered command has at least this much time to be acked (the
+// Edge acks within ~one poll cycle), so the sweep can't expire it first. The
+// sweeper still uses expires_at <= now, so commands in the [now, now+grace)
+// band are simply not delivered and expire untouched (never handed out =
+// correctly edge_unreachable). 60s = four 15s poll intervals of headroom.
+const ackGraceSeconds = 60
+
 // pollCommandDTO is one command delivered in a poll response.
 type pollCommandDTO struct {
 	CorrelationID    string          `json:"correlation_id"`
@@ -37,21 +51,26 @@ type pollCommandDTO struct {
 // idempotency; the Edge dedupes on correlation_id). State does NOT change on
 // poll; the queued->delivered_to_edge transition happens on ACK (Decision 2).
 //
-// The TTL filter (expires_at > now) applies ONLY to queued rows — it mirrors
-// the sweep's CAS predicate (state='queued' AND expires_at <= now) so a queued
-// command can't be both delivered and expired in the same instant (audit phase
-// 13). delivered_to_edge rows are ALWAYS re-pollable regardless of expires_at:
-// the queued TTL doesn't apply once the Edge has acked, and re-delivering lets
-// an Edge that lost its local copy (crash before dispatch) recover the command
-// rather than strand it forever (codex round 1 #3).
+// The TTL filter applies ONLY to queued rows, and with an ackGraceSeconds
+// margin (codex round 2 #1): a queued command is delivered only if it has more
+// than ackGraceSeconds of TTL left, guaranteeing time to ack before the sweep
+// (expires_at <= now) could expire it. delivered_to_edge rows are ALWAYS
+// re-pollable regardless of expires_at — the queued TTL no longer applies once
+// the Edge acked, and re-delivery lets an Edge that lost its local copy (crash
+// before dispatch) recover the command rather than strand it (codex round 1 #3).
+//
+// Ordering puts queued commands FIRST (codex round 2 #5): with the LIMIT, a
+// backlog of stuck delivered_to_edge redeliveries must not crowd out newly
+// queued commands — new operator intent always flows; redeliveries (recovery
+// insurance for an Edge that already has the command) fill the spare slots.
 func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error) {
 	rows, err := db.DB.Query(`
 		SELECT correlation_id, target_endpoint_id, command_type, command_params
 		FROM command_queue
 		WHERE edge_id = $1
 		  AND ( (state = 'queued' AND expires_at > $2) OR state = 'delivered_to_edge' )
-		ORDER BY queued_at ASC
-		LIMIT 50`, edgeID, nowUnix)
+		ORDER BY (state <> 'queued'), queued_at ASC
+		LIMIT 50`, edgeID, nowUnix+ackGraceSeconds)
 	if err != nil {
 		return nil, err
 	}
