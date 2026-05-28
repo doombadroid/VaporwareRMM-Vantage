@@ -551,37 +551,42 @@ func pollEdge(c *fiber.Ctx) error {
 	// a stale value could let a near-expiry command slip past the grace
 	// filter (codex round 3 #4).
 	//
-	// Order + failure handling:
-	//   1. fetchCancelledCorrelationIDs first (read-only — no side effect on
-	//      failure). If it fails, the entire pair returns empty: sending a
-	//      pending commands list without an authoritative cancel signal
-	//      lets the Edge dispatch a row Vantage just terminal-cancelled
-	//      (codex round 1 #5).
-	//   2. fetchPendingCommands second (atomic UPDATE…RETURNING that stamps
-	//      poll_delivered_at). Doing cancelled first means we bail BEFORE
-	//      stamping commands as delivered when the cancel signal cannot be
-	//      assembled (codex round 2 #3).
-	//   3. If cancelled succeeded but commands fails (transient DB error
-	//      on the second query), we PRESERVE the cancelled list and zero
-	//      only commands. Dropping cancelled here would lose the only
-	//      pre-dispatch signal an Edge holding a delivered_to_edge command
-	//      has (codex round 3 #2). The UPDATE in fetchPendingCommands is
-	//      atomic, so a failure rolls it back: no poll_delivered_at markers
-	//      are set on commands the Edge did not actually receive.
+	// Order: fetchPendingCommands FIRST, fetchCancelledCorrelationIDs SECOND
+	// (codex review of PR #3 round 4 #1). fetchPendingCommands' atomic
+	// SELECT FOR UPDATE / UPDATE…RETURNING acquires a row lock; any concurrent
+	// MarkCancelled blocks on that lock and proceeds only after our statement
+	// commits. The subsequent cancelled read therefore observes any cancel
+	// that was racing the poll (post-lock-release), closing the bulk of the
+	// poll-build-vs-cancel window. A small residual race remains between the
+	// cancelled read and the HTTP response landing at the Edge — fundamental
+	// to the eventual-consistency model without an out-of-band cancel ack
+	// (forbidden by #22 Decision 1's outbound-only constraint).
+	//
+	// Failure handling:
+	//   - Commands fetch fails: pendingCommands = [], cancelled fetch still
+	//     runs. Rows are NOT stamped (atomic UPDATE rolled back).
+	//   - Cancelled fetch fails: signal is incomplete. We additionally zero
+	//     pendingCommands so the Edge does not dispatch a (possibly cancelled)
+	//     command without an authoritative signal. cancel_signal_complete=false
+	//     surfaces the degraded state to the Edge so it can skip dispatch
+	//     for any commands it already has locally too (codex round 4 #3).
+	//   - Both succeed: both lists are returned; cancel_signal_complete=true.
+	pendingCommands, cerr := fetchPendingCommands(edgeID, time.Now().Unix())
+	if cerr != nil {
+		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
+		pendingCommands = []pollCommandDTO{}
+	}
 	cancelledIDs, ccerr := fetchCancelledCorrelationIDs(edgeID)
+	cancelSignalComplete := ccerr == nil
 	if ccerr != nil {
 		slog.Error("poll: fetch cancelled correlation_ids", "error", ccerr, "edge_id", edgeID)
 		cancelledIDs = []string{}
-	}
-	var pendingCommands []pollCommandDTO
-	if ccerr == nil {
-		var cerr error
-		pendingCommands, cerr = fetchPendingCommands(edgeID, time.Now().Unix())
-		if cerr != nil {
-			slog.Error("poll: fetch pending commands; preserving cancel signal", "error", cerr, "edge_id", edgeID)
-			pendingCommands = []pollCommandDTO{}
-		}
-	} else {
+		// Withhold commands when the cancel signal cannot be assembled — the
+		// Edge would otherwise dispatch a command that may have been
+		// operator-cancelled in the same poll cycle (codex round 4 #3).
+		// Stamped poll_delivered_at markers persist but the row is reachable
+		// again on the next poll's atomic SELECT (the WHERE matches
+		// state=queued regardless of marker).
 		pendingCommands = []pollCommandDTO{}
 	}
 	resp := fiber.Map{
@@ -592,6 +597,13 @@ func pollEdge(c *fiber.Ctx) error {
 		},
 		"commands":                  pendingCommands,
 		"cancelled_correlation_ids": cancelledIDs,
+		// cancel_signal_complete (codex round 4 #3): true iff the cancellation
+		// signal in this response is authoritative. false means
+		// fetchCancelledCorrelationIDs errored; the Edge MUST NOT dispatch
+		// any pending local command this cycle (a row may have been operator-
+		// cancelled and the signal lost the carrier). Edge resumes dispatch
+		// on the next poll where cancel_signal_complete is true.
+		"cancel_signal_complete":    cancelSignalComplete,
 		"next_poll_after_seconds":   defaultPollIntervalSeconds,
 		"min_required_edge_version": minimum,
 	}

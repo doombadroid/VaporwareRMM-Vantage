@@ -27,10 +27,26 @@ ALTER TABLE edges ADD COLUMN supports_cancel_signal BOOLEAN NOT NULL DEFAULT fal
 
 -- Replace the cancel-signal lookup index from migration 012 with a partial
 -- index matching the new predicate. The terminal-time retention from round 1
--- is gone; filtering by cancellation_confirmed_at IS NULL replaces it.
+-- is gone; filtering by cancellation_confirmed_at IS NULL replaces it. Index
+-- on (edge_id, terminal_at) so the poll-side ORDER BY terminal_at ASC for
+-- the bounded LIMIT (round 4 #4) reads from the index.
 DROP INDEX IF EXISTS idx_command_queue_cancelled_signal;
 CREATE INDEX idx_command_queue_cancelled_signal
-    ON command_queue (edge_id)
+    ON command_queue (edge_id, terminal_at)
     WHERE state = 'cancelled'
       AND delivered_to_endpoint_at IS NULL
       AND cancellation_confirmed_at IS NULL;
+
+-- Backfill (codex review of PR #3 round 4 #2): pre-F4b cancellations were
+-- only allowed when poll_delivered_at IS NULL, so those rows were never
+-- delivered to an Edge — no Edge will ever send command.result(cancelled)
+-- for them. Without a backfill they would emit on every poll forever, growing
+-- the response unboundedly. Set cancellation_confirmed_at = terminal_at for
+-- every such row at upgrade time (idempotent: the WHERE
+-- cancellation_confirmed_at IS NULL guards against re-runs).
+UPDATE command_queue
+SET cancellation_confirmed_at = terminal_at
+WHERE state = 'cancelled'
+  AND poll_delivered_at IS NULL
+  AND cancellation_confirmed_at IS NULL
+  AND terminal_at IS NOT NULL;

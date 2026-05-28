@@ -113,6 +113,16 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 	return out, rows.Err()
 }
 
+// maxCancelSignalBatch bounds one poll's cancel signal so an Edge with a
+// large unconfirmed backlog (offline, slow to confirm, or buggy) doesn't blow
+// the response past proxy/client limits and starve itself of the signal
+// entirely (codex review of PR #3 round 4 #4). 200 matches the headroom on
+// the commands cap (50) and lets a typical Edge drain a backlog over a few
+// poll cycles — Edge confirms each delivered cancellation via
+// command.result(cancelled), the corresponding row drops out, and the next
+// poll surfaces the next batch.
+const maxCancelSignalBatch = 200
+
 // fetchCancelledCorrelationIDs returns correlation_ids of commands the operator
 // cancelled while they were still pre-dispatch (state='cancelled' and never
 // reached delivered_to_endpoint) AND that this Edge has not yet acknowledged
@@ -130,14 +140,17 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 // delivered_to_endpoint_at IS NULL is belt-and-suspenders: MarkCancelled's
 // state predicate already implies no delivered_to_endpoint transition fired,
 // but the explicit NULL guard keeps the cancel signal honest even if a future
-// state-machine change widens the cancel predicate.
+// state-machine change widens the cancel predicate. ORDER BY terminal_at ASC
+// drains oldest cancellations first so a long backlog converges deterministically.
 func fetchCancelledCorrelationIDs(edgeID string) ([]string, error) {
 	rows, err := db.DB.Query(`
 		SELECT correlation_id FROM command_queue
 		WHERE edge_id = $1
 		  AND state = 'cancelled'
 		  AND delivered_to_endpoint_at IS NULL
-		  AND cancellation_confirmed_at IS NULL`, edgeID)
+		  AND cancellation_confirmed_at IS NULL
+		ORDER BY terminal_at ASC
+		LIMIT $2`, edgeID, maxCancelSignalBatch)
 	if err != nil {
 		return nil, err
 	}
