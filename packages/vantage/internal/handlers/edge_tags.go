@@ -25,6 +25,10 @@ import (
 const (
 	maxTagsPerSync        = 1000
 	maxMembershipsPerSync = 100000
+	// tagSyncLockNamespace is the classid for the per-edge tag-sync advisory
+	// lock (pg_advisory_xact_lock(classid, objid)); objid is hashtext(edge_id).
+	// Arbitrary but stable; distinct lock space from any single-key advisory lock.
+	tagSyncLockNamespace = 0x54475953 // "TGYS"
 )
 
 func postEdgeTagsSync(c *fiber.Ctx) error {
@@ -75,6 +79,18 @@ func postEdgeTagsSync(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "transaction begin failed"})
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Serialize concurrent full syncs for THIS edge (codex round 4). Two
+	// overlapping wipe/replace syncs under READ COMMITTED can interleave so the
+	// second's DELETE runs before the first's replacement rows are visible —
+	// leaving stale tags (which would mis-expand command targets) or colliding
+	// on UNIQUE(edge_id,name) with a 500. A per-edge advisory xact lock
+	// serializes them cluster-wide (released on commit/rollback). The two-arg
+	// form uses a distinct lock space from the audit chain's single-key lock,
+	// so they never contend.
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock($1, hashtext($2))`, tagSyncLockNamespace, edgeID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "lock acquire failed"})
+	}
 
 	// Wipe this Edge's tags. membership rows cascade via the FK ON DELETE
 	// CASCADE, but delete them explicitly first so the intent is plain and

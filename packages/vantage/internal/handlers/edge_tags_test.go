@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -112,6 +114,63 @@ func TestEdgeTagsSync_RejectsEmptyAndDuplicateNames(t *testing.T) {
 	defer dup.Body.Close()
 	if dup.StatusCode != 400 {
 		t.Errorf("duplicate name: status=%d, want 400", dup.StatusCode)
+	}
+}
+
+// TestEdgeTagsSync_ConcurrentSameEdge: overlapping full syncs for one edge must
+// all succeed without a UNIQUE(edge_id,name) race (codex round 4). The per-edge
+// advisory lock serializes them; final state is one sync's worth, no 500s.
+func TestEdgeTagsSync_ConcurrentSameEdge(t *testing.T) {
+	app := edgeFederationEnv(t) // DB setup
+	_ = app
+	tok := seedEdgeForPoll(t, "edge-cc", "tenant-x", time.Hour)
+
+	const n = 8
+	var wg sync.WaitGroup
+	statuses := make([]int, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Separate app per goroutine — a single fiber app.Test is not meant
+			// to be driven concurrently; they share the global db.DB.
+			a := fiber.New(fiber.Config{DisableStartupMessage: true})
+			RegisterEdgeRoutes(a)
+			b, _ := json.Marshal(map[string]any{"tags": []map[string]any{
+				{"name": "t1", "endpoint_ids": []string{"h" + strconv.Itoa(i)}},
+				{"name": "t2", "endpoint_ids": []string{"hx"}},
+			}})
+			req := httptest.NewRequest(http.MethodPost, "/api/edge/tags/sync", bytes.NewReader(b))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+tok)
+			resp, err := a.Test(req, -1)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			statuses[i] = resp.StatusCode
+			resp.Body.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("sync %d errored: %v", i, errs[i])
+		}
+		if statuses[i] != 200 {
+			t.Errorf("concurrent sync %d: status=%d, want 200 (no UNIQUE race under the per-edge lock)", i, statuses[i])
+		}
+	}
+	// UNIQUE(edge_id,name) guarantees ≤1 of each name; with serialization the
+	// final state is exactly one sync's set: t1 + t2.
+	var nt int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM tags WHERE edge_id='edge-cc'`).Scan(&nt); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if nt != 2 {
+		t.Errorf("final tag count=%d, want 2 (t1,t2)", nt)
 	}
 }
 
