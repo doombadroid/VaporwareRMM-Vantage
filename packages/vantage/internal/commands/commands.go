@@ -212,55 +212,112 @@ func MarkTerminal(ctx context.Context, tx *sql.Tx, correlationID, edgeID, status
 		status, message, now)
 }
 
-// MarkCancelled: cancel a command in a state still pre-dispatch.
+// CancelInflightWindowSeconds is the cool-down between Vantage re-delivering a
+// delivered_to_edge command via poll and the operator being allowed to cancel
+// it. Covers one poll cycle (15s default) + Edge persist+dispatch+ack latency
+// + safety margin. While the row's last_re_polled_at is inside this window the
+// Edge may have received the command and dispatched it before the cancellation
+// is computable into a poll response, so we refuse the cancel — the operator
+// retries after the window elapses.
+const CancelInflightWindowSeconds = 30
+
+// MarkCancelled: cancel a command still pre-dispatch.
 //   - state='queued' AND poll_delivered_at IS NULL → cancel succeeds.
-//   - state='delivered_to_edge' → cancel succeeds (F4b restores Decision 6's
-//     full window via the cancel signal in the poll response).
+//   - state='delivered_to_edge' AND edge advertises supports_cancel_signal
+//     AND (last_re_polled_at IS NULL OR last_re_polled_at < now-30s) → cancel
+//     succeeds. F4b Decision 6 restoration, with three guards:
 //   - state='queued' AND poll_delivered_at IS NOT NULL → ErrNotCancellable.
-//     The command is in flight between Vantage and the Edge; the poll response
-//     that carried it was built without this cancellation, and Vantage can't
-//     synchronously inject it. The operator must wait until the Edge acks
-//     (state moves to delivered_to_edge) and try again — typically one poll
-//     cycle (~15s). This preserves F4a's race protection (codex review of
-//     PR #3, finding 3): without it, a cancel landing between poll-build and
-//     Edge-process would terminal-cancel a row whose command the Edge will run
-//     anyway, dropping the authoritative result on the cancelled row.
+//     In flight between Vantage poll-build and Edge ack; the just-built poll
+//     response did not carry this cancellation (codex review of PR #3 round 1
+//     #3). Operator retries after the Edge acks (~one poll cycle).
+//   - state='delivered_to_edge' AND last_re_polled_at recent → ErrNotCancellable.
+//     Closes the analogous race for delivered_to_edge (codex round 2 #1):
+//     the row was just included in a poll response, the Edge will dispatch
+//     before the next cancel-signal poll. Operator retries after the window.
+//   - state='delivered_to_edge' AND !edges.supports_cancel_signal →
+//     ErrNotCancellable. Forces the Edge to advertise F4b capability before
+//     widening the cancel window (codex round 2 #5); without the advertised
+//     signal handler, the cancel succeeds at Vantage but the Edge dispatches
+//     and the terminal result silently CAS-misses.
 //   - state='delivered_to_endpoint' or later → ErrNotCancellable (Decision 6
-//     cutoff — the command is on its way to running; the authoritative
-//     terminal result lands on the row).
+//     cutoff — authoritative terminal result lands on the row).
 //
-// The delivered_to_edge widening is safe because F3 Edge code does not call
-// the ack endpoint (it logs+discards commands), so no non-F4b Edge can have
-// transitioned a command to delivered_to_edge. Every Edge in delivered_to_edge
-// is therefore F4b-capable and honors the cancel signal.
+// The cancel is implemented as one atomic UPDATE that JOINs to edges for the
+// supports_cancel_signal predicate; a zero-RowsAffected outcome falls through
+// to classifyCancelMiss for a precise sentinel.
 func MarkCancelled(ctx context.Context, tx *sql.Tx, correlationID, actorUserID string) error {
 	now := time.Now().Unix()
+	inflightCutoff := now - CancelInflightWindowSeconds
 	res, err := tx.ExecContext(ctx, `
-		UPDATE command_queue
+		UPDATE command_queue cq
 		SET state = 'cancelled', result_status = 'cancelled',
 			result_message = 'cancelled by operator', terminal_at = $2
-		WHERE correlation_id = $1 AND (
-			(state = 'queued' AND poll_delivered_at IS NULL)
-			OR state = 'delivered_to_edge'
-		)`,
-		correlationID, now)
+		FROM edges e
+		WHERE cq.correlation_id = $1
+		  AND cq.edge_id = e.id
+		  AND (
+		    (cq.state = 'queued' AND cq.poll_delivered_at IS NULL)
+		    OR (
+		      cq.state = 'delivered_to_edge'
+		      AND e.supports_cancel_signal = true
+		      AND (cq.last_re_polled_at IS NULL OR cq.last_re_polled_at < $3)
+		    )
+		  )`,
+		correlationID, now, inflightCutoff)
 	if err != nil {
 		return fmt.Errorf("commands: cancel: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		// Distinguish not-found from past-the-window for the handler's status.
-		var st string
-		switch err := tx.QueryRowContext(ctx, `SELECT state FROM command_queue WHERE correlation_id = $1`, correlationID).Scan(&st); {
-		case errors.Is(err, sql.ErrNoRows):
-			return ErrNotFound
-		case err != nil:
-			return fmt.Errorf("commands: cancel classify: %w", err)
-		default:
-			return fmt.Errorf("%w (current=%s)", ErrNotCancellable, st)
-		}
+		return classifyCancelMiss(ctx, tx, correlationID, inflightCutoff)
 	}
 	return events.AuditLogSyncTx(tx, actorUserID, "command.cancelled", "command", correlationID, "", "")
+}
+
+// classifyCancelMiss diagnoses a zero-rows MarkCancelled outcome. It returns
+// ErrNotFound for a missing row and ErrNotCancellable (carrying the precise
+// reason) otherwise. The diagnosis runs inside the caller's tx so it observes
+// the same snapshot the failed UPDATE saw.
+func classifyCancelMiss(ctx context.Context, tx *sql.Tx, correlationID string, inflightCutoff int64) error {
+	var (
+		state              string
+		pollDeliveredAt    sql.NullInt64
+		lastRePolledAt     sql.NullInt64
+		supportsCancelSig  bool
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT cq.state, cq.poll_delivered_at, cq.last_re_polled_at, COALESCE(e.supports_cancel_signal, false)
+		FROM command_queue cq
+		LEFT JOIN edges e ON e.id = cq.edge_id
+		WHERE cq.correlation_id = $1`,
+		correlationID,
+	).Scan(&state, &pollDeliveredAt, &lastRePolledAt, &supportsCancelSig)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return ErrNotFound
+	case err != nil:
+		return fmt.Errorf("commands: cancel classify: %w", err)
+	}
+	switch state {
+	case StateQueued:
+		if pollDeliveredAt.Valid {
+			return fmt.Errorf("%w (current=queued, in flight to Edge — retry after the Edge acks)", ErrNotCancellable)
+		}
+		// Unreachable: UPDATE matches queued+IS NULL, so this branch only
+		// fires if the row state changed between UPDATE and SELECT. Treat as
+		// generic not-cancellable.
+		return fmt.Errorf("%w (current=queued, transient)", ErrNotCancellable)
+	case StateDeliveredToEdge:
+		if !supportsCancelSig {
+			return fmt.Errorf("%w (current=delivered_to_edge, edge has not advertised cancel-signal support)", ErrNotCancellable)
+		}
+		if lastRePolledAt.Valid && lastRePolledAt.Int64 >= inflightCutoff {
+			return fmt.Errorf("%w (current=delivered_to_edge, in flight via recent re-poll — retry after the cancel-inflight window elapses)", ErrNotCancellable)
+		}
+		return fmt.Errorf("%w (current=delivered_to_edge, transient)", ErrNotCancellable)
+	default:
+		return fmt.Errorf("%w (current=%s)", ErrNotCancellable, state)
+	}
 }
 
 // ExpireStaleQueued is the TTL sweep (Decision 5). It transitions every

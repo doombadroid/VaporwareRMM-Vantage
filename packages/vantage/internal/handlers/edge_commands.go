@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"vaporrmm/vantage/internal/commands"
 	"vaporrmm/vantage/internal/db"
@@ -72,9 +71,17 @@ type pollCommandDTO struct {
 //   - queued-first ordering under the LIMIT (codex round 2 #5), so a backlog
 //     of stuck redeliveries can't starve newly queued commands.
 //
-// COALESCE keeps the FIRST poll_delivered_at (the marker means "first handed
-// out"); the RETURNING order is unspecified but irrelevant (the Edge
-// processes every command).
+// Two delivery markers:
+//   - poll_delivered_at (COALESCE): first hand-out, never updated; gates the
+//     cancel-vs-poll race for queued rows.
+//   - last_re_polled_at (assignment): refreshed on every re-delivery (codex
+//     review of PR #3 round 2 #1); gates the cancel-vs-re-poll race for
+//     delivered_to_edge rows. MarkCancelled refuses delivered_to_edge if
+//     this is inside the inflight window (CancelInflightWindowSeconds).
+//
+// COALESCE on poll_delivered_at keeps the original first-handed-out timestamp;
+// the RETURNING order is unspecified but irrelevant (the Edge processes every
+// command).
 func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error) {
 	rows, err := db.DB.Query(`
 		WITH picked AS (
@@ -87,7 +94,8 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE command_queue c
-		SET poll_delivered_at = COALESCE(c.poll_delivered_at, $2)
+		SET poll_delivered_at = COALESCE(c.poll_delivered_at, $2),
+		    last_re_polled_at = $2
 		FROM picked
 		WHERE c.correlation_id = picked.correlation_id
 		RETURNING c.correlation_id, c.target_endpoint_id, c.command_type, c.command_params`,
@@ -107,39 +115,31 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 	return out, rows.Err()
 }
 
-// cancelSignalRetentionSeconds bounds how long a cancelled command stays in
-// the poll-response cancel signal. The Edge no-ops on unknown correlation_ids,
-// so the only cost of including an old cancellation is wire bytes; but with no
-// bound, every cancel for an Edge replays on every poll forever (codex review
-// of PR #3, finding 4).
-//
-// 7 days is much longer than any realistic Edge polling-lag scenario — an Edge
-// offline 7 days has bigger problems than missing an old cancellation, and the
-// command's underlying queued/delivered_to_edge row is long since reaped by
-// the TTL sweeper / a future retention sweep. If a precise ack signal lands
-// later (e.g. a cancel_acked_at column set by the cancellation_confirmed event
-// handler), this can shrink to "until confirmed" rather than the time bound.
-const cancelSignalRetentionSeconds = 7 * 24 * 60 * 60
-
 // fetchCancelledCorrelationIDs returns correlation_ids of commands the operator
 // cancelled while they were still pre-dispatch (state='cancelled' and never
-// reached delivered_to_endpoint). F4b includes these in the poll response so
-// the Edge can drop them between persist and dispatch (Decision 6 cancel
-// window restoration; see commands.MarkCancelled).
+// reached delivered_to_endpoint) AND that this Edge has not yet acknowledged
+// via command.result(status=cancelled). F4b includes these in the poll
+// response so the Edge can drop them between persist and dispatch (Decision 6
+// cancel window restoration; see commands.MarkCancelled).
+//
+// Filtering on cancellation_confirmed_at IS NULL (codex review of PR #3 round
+// 2 #6) replaces the round-1 7-day retention bound: an Edge offline longer
+// than the retention window would otherwise lose its signal and dispatch a
+// local 'received' row that Vantage has terminal-cancelled. Now an unconfirmed
+// cancellation stays in the signal indefinitely; the Edge confirms via the
+// cancellation_confirmed event and the row drops out.
 //
 // delivered_to_endpoint_at IS NULL is belt-and-suspenders: MarkCancelled's
-// state predicate (queued|delivered_to_edge) already implies no
-// delivered_to_endpoint transition fired, but the explicit NULL guard keeps
-// the cancel signal honest even if a future state-machine change widens the
-// cancel predicate.
+// state predicate already implies no delivered_to_endpoint transition fired,
+// but the explicit NULL guard keeps the cancel signal honest even if a future
+// state-machine change widens the cancel predicate.
 func fetchCancelledCorrelationIDs(edgeID string) ([]string, error) {
-	cutoff := time.Now().Unix() - cancelSignalRetentionSeconds
 	rows, err := db.DB.Query(`
 		SELECT correlation_id FROM command_queue
 		WHERE edge_id = $1
 		  AND state = 'cancelled'
 		  AND delivered_to_endpoint_at IS NULL
-		  AND terminal_at > $2`, edgeID, cutoff)
+		  AND cancellation_confirmed_at IS NULL`, edgeID)
 	if err != nil {
 		return nil, err
 	}

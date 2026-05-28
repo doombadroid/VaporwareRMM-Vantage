@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -340,8 +341,9 @@ func TestPoll_CancelledCorrelationIDs_EdgeScoped(t *testing.T) {
 
 // TestEdgeEvents_CommandResultCancelled_Accepted: F4b accepts
 // command.result(status=cancelled) as informational confirmation from the
-// Edge. Vantage's row is already cancelled (operator initiated), so the
-// handler records an audit entry without re-transitioning state.
+// Edge. The handler CAS-sets cancellation_confirmed_at NULL→now and writes
+// the audit row only on the winning UPDATE — state stays 'cancelled' (already
+// correct; the operator initiated it).
 func TestEdgeEvents_CommandResultCancelled_Accepted(t *testing.T) {
 	app := edgeFederationEnv(t)
 	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
@@ -365,7 +367,7 @@ func TestEdgeEvents_CommandResultCancelled_Accepted(t *testing.T) {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
 	var out struct {
-		Accepted int             `json:"accepted"`
+		Accepted int              `json:"accepted"`
 		Rejected []map[string]any `json:"rejected"`
 	}
 	json.NewDecoder(resp.Body).Decode(&out)
@@ -375,6 +377,11 @@ func TestEdgeEvents_CommandResultCancelled_Accepted(t *testing.T) {
 	if s := cmdState(t, "cid-conf"); s != "cancelled" {
 		t.Errorf("state after cancel-confirmation event=%s, want cancelled (state should not transition)", s)
 	}
+	var confirmed sql.NullInt64
+	db.DB.QueryRow(`SELECT cancellation_confirmed_at FROM command_queue WHERE correlation_id='cid-conf'`).Scan(&confirmed)
+	if !confirmed.Valid {
+		t.Error("cancellation_confirmed_at not set after confirmation event")
+	}
 	var auditN int
 	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='command.cancellation_confirmed' AND resource_id='cid-conf'`).Scan(&auditN)
 	if auditN != 1 {
@@ -382,23 +389,70 @@ func TestEdgeEvents_CommandResultCancelled_Accepted(t *testing.T) {
 	}
 }
 
-// TestPoll_CancelSignal_BoundedByRetention: cancellations older than
-// cancelSignalRetentionSeconds (7 days) drop out of the cancel signal so the
-// poll response doesn't grow unbounded over a long-lived Edge (codex review
-// of PR #3, finding 4). A confirmed-and-old cancellation is no-op locally on
-// the Edge anyway, so dropping it has no correctness impact.
-func TestPoll_CancelSignal_BoundedByRetention(t *testing.T) {
+// TestEdgeEvents_CommandResultCancelled_Idempotent: a retried confirmation
+// event for an already-confirmed cancellation is accepted (HTTP 200) but does
+// NOT duplicate the audit row (codex review of PR #3 round 2 #2). The CAS on
+// cancellation_confirmed_at NULL→now makes retries benign no-ops at the audit
+// chain level.
+func TestEdgeEvents_CommandResultCancelled_Idempotent(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	seedQueuedCommand(t, "cid-retry", "tenant-x", "edge-1", "host-a", now+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-retry'`, now)
+
+	body := map[string]any{
+		"events": []map[string]any{
+			{"correlation_id": "cid-retry", "type": "command.result", "occurred_at": now, "payload": map[string]string{"status": "cancelled", "message": "first"}},
+		},
+		"audit_chain_head": map[string]any{"seq": 1, "signature": "sig"},
+	}
+	resp1 := postEdgeEventsHTTP(t, app, tok, body)
+	resp1.Body.Close()
+
+	// Retry the same event (simulating a retried Edge batch on lost HTTP response).
+	body2 := map[string]any{
+		"events": []map[string]any{
+			{"correlation_id": "cid-retry", "type": "command.result", "occurred_at": now + 1, "payload": map[string]string{"status": "cancelled", "message": "second"}},
+		},
+		"audit_chain_head": map[string]any{"seq": 2, "signature": "sig2"},
+	}
+	resp2 := postEdgeEventsHTTP(t, app, tok, body2)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Fatalf("retry status=%d", resp2.StatusCode)
+	}
+	var out struct {
+		Accepted int              `json:"accepted"`
+		Rejected []map[string]any `json:"rejected"`
+	}
+	json.NewDecoder(resp2.Body).Decode(&out)
+	if out.Accepted != 1 {
+		t.Errorf("retry accepted=%d, want 1 (idempotent acceptance)", out.Accepted)
+	}
+	var auditN int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='command.cancellation_confirmed' AND resource_id='cid-retry'`).Scan(&auditN)
+	if auditN != 1 {
+		t.Errorf("audit rows after retry=%d, want 1 (no duplicate)", auditN)
+	}
+}
+
+// TestPoll_CancelSignal_DropsAfterConfirmation: cancellations confirmed by the
+// Edge (cancellation_confirmed_at IS NOT NULL) drop out of the cancel signal.
+// An unconfirmed cancellation persists in the signal indefinitely so an Edge
+// that returns from an arbitrarily long outage still sees the drop (codex
+// review of PR #3 round 2 #6).
+func TestPoll_CancelSignal_DropsAfterConfirmation(t *testing.T) {
 	app := edgeFederationEnv(t)
 	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
 	now := time.Now().Unix()
 	future := now + 3600
-	old := now - cancelSignalRetentionSeconds - 60 // just past the bound
 
-	seedQueuedCommand(t, "cid-recent", "tenant-x", "edge-1", "host-a", future)
-	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-recent'`, now)
+	seedQueuedCommand(t, "cid-unconfirmed", "tenant-x", "edge-1", "host-a", future)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-unconfirmed'`, now)
 
-	seedQueuedCommand(t, "cid-old", "tenant-x", "edge-1", "host-b", future)
-	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-old'`, old)
+	seedQueuedCommand(t, "cid-confirmed", "tenant-x", "edge-1", "host-b", future)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1, cancellation_confirmed_at=$1 WHERE correlation_id='cid-confirmed'`, now)
 
 	resp := postEdgePoll(t, app, tok, pollBody())
 	defer resp.Body.Close()
@@ -410,11 +464,11 @@ func TestPoll_CancelSignal_BoundedByRetention(t *testing.T) {
 	for _, c := range out.CancelledCorrelationIDs {
 		got[c] = true
 	}
-	if !got["cid-recent"] {
-		t.Error("recent cancellation missing from signal")
+	if !got["cid-unconfirmed"] {
+		t.Error("unconfirmed cancellation missing from signal")
 	}
-	if got["cid-old"] {
-		t.Error("cancellation older than retention window included in signal (bandwidth leak)")
+	if got["cid-confirmed"] {
+		t.Error("confirmed cancellation still appears in signal (would replay forever)")
 	}
 }
 

@@ -57,7 +57,7 @@ func setupCommandsTest(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id, email, password_hash, role) VALUES ('op1', 'op@test.local', 'x', 'super_admin')`); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
-	if _, err := db.DB.Exec(`INSERT INTO edges (id, name, tenant_id, status, created_at) VALUES ('edge1', 'Edge', 'tenant1', 'active', $1)`, now); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO edges (id, name, tenant_id, status, created_at, supports_cancel_signal) VALUES ('edge1', 'Edge', 'tenant1', 'active', $1, true)`, now); err != nil {
 		t.Fatalf("seed edge: %v", err)
 	}
 }
@@ -315,6 +315,76 @@ func TestMarkCancelled_DeliveredToEndpoint_Refuses(t *testing.T) {
 	defer func() { _ = tx.Rollback() }()
 	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
 		t.Fatalf("cancel of delivered_to_endpoint: want ErrNotCancellable, got %v", err)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_RequiresCancelSignalSupport: F4b widening
+// only kicks in for Edges that have advertised cancel-signal support in their
+// poll request (codex review of PR #3 round 2 #5). An Edge whose
+// supports_cancel_signal is false (default for pre-F4b Edges or those that
+// have not yet polled) keeps the F4a-narrow queued-only behavior; cancel from
+// delivered_to_edge refuses.
+func TestMarkCancelled_DeliveredToEdge_RequiresCancelSignalSupport(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	// setupCommandsTest seeds edge1 with supports_cancel_signal=true; flip it
+	// to simulate a non-advertising Edge.
+	if _, err := db.DB.Exec(`UPDATE edges SET supports_cancel_signal = false WHERE id='edge1'`); err != nil {
+		t.Fatalf("flip supports_cancel_signal: %v", err)
+	}
+	cid := enqueueOne(t)
+	forceState(t, cid, StateDeliveredToEdge)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel without cancel-signal support: want ErrNotCancellable, got %v", err)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_RefusesRecentRePoll: closes the
+// cancel-vs-poll race for delivered_to_edge (codex review of PR #3 round 2 #1).
+// If the row was re-polled within CancelInflightWindowSeconds, the response
+// that carried it may not have included this cancellation; refuse the cancel
+// and let the operator retry after the window elapses (Edge will be safely
+// past dispatch or ack'd into delivered_to_endpoint by then).
+func TestMarkCancelled_DeliveredToEdge_RefusesRecentRePoll(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	forceState(t, cid, StateDeliveredToEdge)
+	// Stamp last_re_polled_at to "just now" — inside the inflight window.
+	if _, err := db.DB.Exec(`UPDATE command_queue SET last_re_polled_at=$1 WHERE correlation_id=$2`, time.Now().Unix(), cid); err != nil {
+		t.Fatalf("stamp last_re_polled_at: %v", err)
+	}
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel during inflight window: want ErrNotCancellable, got %v", err)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_OldRePollAllows: after the inflight window
+// elapses, the same delivered_to_edge cancellation succeeds (no stuck-state
+// where the Edge crashed mid-process and the row can never be cancelled).
+func TestMarkCancelled_DeliveredToEdge_OldRePollAllows(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	forceState(t, cid, StateDeliveredToEdge)
+	// last_re_polled_at far in the past — well outside the inflight window.
+	if _, err := db.DB.Exec(`UPDATE command_queue SET last_re_polled_at=$1 WHERE correlation_id=$2`, time.Now().Unix()-CancelInflightWindowSeconds-60, cid); err != nil {
+		t.Fatalf("stamp last_re_polled_at: %v", err)
+	}
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel outside inflight window: want nil, got %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := currentState(t, cid); got != StateCancelled {
+		t.Errorf("state=%s, want cancelled", got)
 	}
 }
 

@@ -85,8 +85,10 @@ export type CommandList = {
   has_more: boolean;
 };
 
-// States from which a command can still be cancelled. F4a allows cancel only
-// while `queued` (the backend MarkCancelled is queued-only — once the Edge
-// acks, cancellation needs an Edge-side signal that lands in F4b). Showing
-// Cancel for delivered_to_edge would render an action that always 409s.
-export const CANCELLABLE_STATES = ["queued"];
+// States from which a command can still be cancelled. F4b restores Decision
+// 6's full cancel window: queued (not in poll flight) AND delivered_to_edge
+// (Edge advertised cancel-signal support, not in re-poll flight). The backend
+// MarkCancelled enforces the in-flight + capability guards, so a 409 from the
+// API still means "wait + retry" for a transiently-uncancellable command and
+// the dashboard polls list refresh will show the new state on the next tick.
+export const CANCELLABLE_STATES = ["queued", "delivered_to_edge"];
