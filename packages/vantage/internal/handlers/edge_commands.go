@@ -71,16 +71,15 @@ type pollCommandDTO struct {
 //   - queued-first ordering under the LIMIT (codex round 2 #5), so a backlog
 //     of stuck redeliveries can't starve newly queued commands.
 //
-// Two delivery markers:
-//   - poll_delivered_at (COALESCE): first hand-out, never updated; gates the
-//     cancel-vs-poll race for queued rows.
-//   - last_re_polled_at (assignment): refreshed on every re-delivery (codex
-//     review of PR #3 round 2 #1); gates the cancel-vs-re-poll race for
-//     delivered_to_edge rows. MarkCancelled refuses delivered_to_edge if
-//     this is inside the inflight window (CancelInflightWindowSeconds).
+// poll_delivered_at uses COALESCE so the marker is set on the first hand-out
+// and never updated — it gates the cancel-vs-poll race for queued rows. The
+// cancel-vs-poll race for delivered_to_edge is closed by a stabilization
+// window on delivered_to_edge_at in MarkCancelled (codex review of PR #3
+// round 3 #1), not by refreshing a poll-time marker on every re-delivery: a
+// re-polled marker would always be fresh for an actively-polling Edge and
+// the cancel widening would never trigger.
 //
-// COALESCE on poll_delivered_at keeps the original first-handed-out timestamp;
-// the RETURNING order is unspecified but irrelevant (the Edge processes every
+// The RETURNING order is unspecified but irrelevant (the Edge processes every
 // command).
 func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error) {
 	rows, err := db.DB.Query(`
@@ -94,8 +93,7 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE command_queue c
-		SET poll_delivered_at = COALESCE(c.poll_delivered_at, $2),
-		    last_re_polled_at = $2
+		SET poll_delivered_at = COALESCE(c.poll_delivered_at, $2)
 		FROM picked
 		WHERE c.correlation_id = picked.correlation_id
 		RETURNING c.correlation_id, c.target_endpoint_id, c.command_type, c.command_params`,

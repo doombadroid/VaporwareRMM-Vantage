@@ -543,43 +543,46 @@ func pollEdge(c *fiber.Ctx) error {
 	}
 
 	// ---- Phase 4: response ----
-	// Pending commands AND the F4b cancellation signal must be JOINTLY
-	// authoritative for this Edge to dispatch safely. Read AFTER commit (poll
-	// does not mutate command state — that happens on ack — so a committed
-	// read is correct and avoids holding the edges-row lock across the scan).
-	// Fresh timestamp (NOT the pre-lock nowUnix): if the poll blocked on the
-	// edges FOR UPDATE lock or commit, a stale value could let a near-expiry
-	// command slip past the grace filter (codex round 3 #4).
+	// Pending commands AND the F4b cancellation signal must both be assembled
+	// safely. Read AFTER commit (poll does not mutate command state — that
+	// happens on ack — so a committed read is correct and avoids holding the
+	// edges-row lock across the scan). Fresh timestamp (NOT the pre-lock
+	// nowUnix): if the poll blocked on the edges FOR UPDATE lock or commit,
+	// a stale value could let a near-expiry command slip past the grace
+	// filter (codex round 3 #4).
 	//
-	// Order matters (codex review of PR #3 round 2 #3):
-	//   1. fetchCancelledCorrelationIDs is read-only — no side effect on
-	//      failure.
-	//   2. fetchPendingCommands runs an atomic UPDATE…RETURNING that stamps
-	//      poll_delivered_at and last_re_polled_at on every returned row.
-	// Doing cancelled first lets us bail before stamping commands as
-	// "delivered to Edge" when the cancellation signal cannot be assembled.
-	// Otherwise a transient cancelled-query failure would leave queued rows
-	// stamped poll_delivered_at — non-cancellable by the F4a guard — without
-	// the Edge ever seeing them.
-	//
-	// Coupled failure semantics (codex review of PR #3 round 1 finding 5):
-	// if EITHER fetch fails, BOTH lists go empty. Sending commands without an
-	// authoritative cancelled list lets the Edge dispatch a row that Vantage
-	// has just terminal-cancelled, and the eventual result CAS-misses. Empty
-	// + empty is safe (the Edge gets nothing this cycle, retries next), and
-	// since fetchPendingCommands' UPDATE is atomic, a fail there does not
-	// commit the delivery markers either.
+	// Order + failure handling:
+	//   1. fetchCancelledCorrelationIDs first (read-only — no side effect on
+	//      failure). If it fails, the entire pair returns empty: sending a
+	//      pending commands list without an authoritative cancel signal
+	//      lets the Edge dispatch a row Vantage just terminal-cancelled
+	//      (codex round 1 #5).
+	//   2. fetchPendingCommands second (atomic UPDATE…RETURNING that stamps
+	//      poll_delivered_at). Doing cancelled first means we bail BEFORE
+	//      stamping commands as delivered when the cancel signal cannot be
+	//      assembled (codex round 2 #3).
+	//   3. If cancelled succeeded but commands fails (transient DB error
+	//      on the second query), we PRESERVE the cancelled list and zero
+	//      only commands. Dropping cancelled here would lose the only
+	//      pre-dispatch signal an Edge holding a delivered_to_edge command
+	//      has (codex round 3 #2). The UPDATE in fetchPendingCommands is
+	//      atomic, so a failure rolls it back: no poll_delivered_at markers
+	//      are set on commands the Edge did not actually receive.
 	cancelledIDs, ccerr := fetchCancelledCorrelationIDs(edgeID)
-	var pendingCommands []pollCommandDTO
-	var cerr error
-	if ccerr == nil {
-		pendingCommands, cerr = fetchPendingCommands(edgeID, time.Now().Unix())
-	}
-	if cerr != nil || ccerr != nil {
-		slog.Error("poll: fetch commands or cancelled correlation_ids",
-			"cmd_err", cerr, "cancel_err", ccerr, "edge_id", edgeID)
-		pendingCommands = []pollCommandDTO{}
+	if ccerr != nil {
+		slog.Error("poll: fetch cancelled correlation_ids", "error", ccerr, "edge_id", edgeID)
 		cancelledIDs = []string{}
+	}
+	var pendingCommands []pollCommandDTO
+	if ccerr == nil {
+		var cerr error
+		pendingCommands, cerr = fetchPendingCommands(edgeID, time.Now().Unix())
+		if cerr != nil {
+			slog.Error("poll: fetch pending commands; preserving cancel signal", "error", cerr, "edge_id", edgeID)
+			pendingCommands = []pollCommandDTO{}
+		}
+	} else {
+		pendingCommands = []pollCommandDTO{}
 	}
 	resp := fiber.Map{
 		"vantage_version": "0.1.0",

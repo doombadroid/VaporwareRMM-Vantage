@@ -245,8 +245,11 @@ func TestCancel_DeliveredToEdge_200(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&enq)
 	resp.Body.Close()
 	cid := enq.CorrelationIDs[0]
-	// Edge acked it (delivered_to_edge). Under F4b this is still cancellable.
-	db.DB.Exec(`UPDATE command_queue SET state='delivered_to_edge' WHERE correlation_id=$1`, cid)
+	// Edge acked it (delivered_to_edge). Under F4b this is still cancellable
+	// provided the edge advertised cancel-signal support (default in the test
+	// seed) AND delivered_to_edge_at is outside the stabilization window.
+	past := time.Now().Add(-time.Minute).Unix()
+	db.DB.Exec(`UPDATE command_queue SET state='delivered_to_edge', delivered_to_edge_at=$1 WHERE correlation_id=$2`, past, cid)
 	c := doCmd(t, app, http.MethodDelete, "/api/v1/commands/"+cid, nil)
 	defer c.Body.Close()
 	if c.StatusCode != 200 {
