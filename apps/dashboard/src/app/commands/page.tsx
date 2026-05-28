@@ -25,8 +25,12 @@ function fmtTime(unix?: number): string {
   return new Date(unix * 1000).toLocaleString();
 }
 
+const PAGE_SIZE = 50;
+
 export default function CommandsPage() {
   const [commands, setCommands] = useState<Command[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
   const [edges, setEdges] = useState<{ id: string; name: string }[]>([]);
   const [edgeFilter, setEdgeFilter] = useState("");
   const [stateFilter, setStateFilter] = useState("");
@@ -37,28 +41,50 @@ export default function CommandsPage() {
     const params = new URLSearchParams();
     if (edgeFilter) params.set("edge_id", edgeFilter);
     if (stateFilter) params.set("state", stateFilter);
+    params.set("limit", String(PAGE_SIZE));
+    params.set("offset", String(offset));
     api
       .get<CommandList>("/commands?" + params.toString())
-      .then((r) => setCommands(r.data.data))
+      .then((r) => {
+        setCommands(r.data.data);
+        setTotal(r.data.total);
+      })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : "fetch failed"));
-  }, [edgeFilter, stateFilter]);
+  }, [edgeFilter, stateFilter, offset]);
 
-  // Initial + filter-change load, plus 10s auto-refresh.
+  // Initial + filter/page-change load, plus 10s auto-refresh of the page.
   useEffect(() => {
     load();
     const t = setInterval(load, 10_000);
     return () => clearInterval(t);
   }, [load]);
 
+  // Changing a filter resets to the first page.
+  const applyFilter = (set: (v: string) => void) => (v: string) => {
+    setOffset(0);
+    set(v);
+  };
+
   useEffect(() => {
-    // limit=200 (the backend's max page) so the filter + modal cover fleets
-    // larger than the default 50-edge page (codex round 2 #4).
-    api
-      .get<EdgeList>("/edges?limit=200")
-      .then((r) => setEdges(r.data.data.map((e) => ({ id: e.id, name: e.name || e.id }))))
-      .catch(() => {
-        /* edge dropdown is best-effort; filtering still works by typing */
-      });
+    // Fetch ALL edge pages by following has_more (codex round 3 #5): the
+    // backend caps one page at 200, so fleets larger than that need paging or
+    // edges beyond the first page are unselectable in the filter + modal.
+    let cancelled = false;
+    (async () => {
+      const acc: { id: string; name: string }[] = [];
+      const LIMIT = 200;
+      for (let off = 0; ; off += LIMIT) {
+        const r = await api.get<EdgeList>(`/edges?limit=${LIMIT}&offset=${off}`);
+        acc.push(...r.data.data.map((e) => ({ id: e.id, name: e.name || e.id })));
+        if (!r.data.has_more || off > 100_000) break;
+      }
+      if (!cancelled) setEdges(acc);
+    })().catch(() => {
+      /* edge dropdown is best-effort; filtering still works by typing */
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const cancel = async (correlationID: string) => {
@@ -96,7 +122,7 @@ export default function CommandsPage() {
         <div className="mb-4 flex gap-3 text-xs">
           <select
             value={edgeFilter}
-            onChange={(e) => setEdgeFilter(e.target.value)}
+            onChange={(e) => applyFilter(setEdgeFilter)(e.target.value)}
             className="rounded-md bg-white/[0.04] border border-white/10 px-2 py-1.5 text-white/80"
           >
             <option value="">All edges</option>
@@ -108,7 +134,7 @@ export default function CommandsPage() {
           </select>
           <select
             value={stateFilter}
-            onChange={(e) => setStateFilter(e.target.value)}
+            onChange={(e) => applyFilter(setStateFilter)(e.target.value)}
             className="rounded-md bg-white/[0.04] border border-white/10 px-2 py-1.5 text-white/80"
           >
             <option value="">All states</option>
@@ -171,6 +197,30 @@ export default function CommandsPage() {
               ))}
             </tbody>
           </table>
+        )}
+
+        {total > 0 && (
+          <div className="mt-4 flex items-center justify-between text-xs text-white/45">
+            <span>
+              {offset + 1}–{offset + commands.length} of {total}
+            </span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                disabled={offset === 0}
+                className="rounded-md border border-white/10 px-2 py-1 disabled:opacity-40 hover:text-white/80"
+              >
+                Prev
+              </button>
+              <button
+                onClick={() => setOffset(offset + PAGE_SIZE)}
+                disabled={offset + commands.length >= total}
+                className="rounded-md border border-white/10 px-2 py-1 disabled:opacity-40 hover:text-white/80"
+              >
+                Next
+              </button>
+            </div>
+          </div>
         )}
 
         {modalOpen && (
