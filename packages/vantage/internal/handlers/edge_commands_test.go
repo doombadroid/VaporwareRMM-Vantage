@@ -617,6 +617,79 @@ func TestEdgeEvents_CommandResultCancelled_RejectsUnowned(t *testing.T) {
 	}
 }
 
+// TestEdgeEvents_CommandResultAfterCancel_RecordsAudit: F4 cancel is
+// best-effort. If the operator cancels in the dispatch window AFTER the Edge
+// has already handed the command to the endpoint, the eventual terminal
+// command.result from the agent lands on a row Vantage has already
+// terminal-cancelled. State stays 'cancelled' (operator intent is what the
+// dashboard shows), but the audit log records command.executed_after_cancel
+// with the agent's reported status so the divergence is forensically
+// recoverable. The cancel guarantee is best-effort, not exactly-once;
+// restart_service's small blast radius makes this acceptable for F4 (see
+// issue #22 F4 known-limitation note).
+func TestEdgeEvents_CommandResultAfterCancel_RecordsAudit(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", 25*24*time.Hour)
+	now := time.Now().Unix()
+	// Seed a cancelled row that has been delivered to the endpoint — the
+	// race window where the operator cancelled but the Edge had already
+	// dispatched. (In production this comes from MarkCancelled on a
+	// delivered_to_edge row; here we force-set the result for fixture
+	// simplicity.)
+	seedQueuedCommand(t, "cid-race", "tenant-x", "edge-1", "host-a", now+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1, delivered_to_endpoint_at=$1 WHERE correlation_id='cid-race'`, now)
+
+	resp := postEdgeEventsHTTP(t, app, tok, map[string]any{
+		"events": []map[string]any{
+			{
+				"correlation_id": "cid-race",
+				"type":           "command.result",
+				"occurred_at":    now,
+				"payload":        map[string]string{"status": "succeeded", "message": "service restarted"},
+			},
+		},
+		"audit_chain_head": map[string]any{"seq": 1, "signature": "sig"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out struct {
+		Accepted int              `json:"accepted"`
+		Rejected []map[string]any `json:"rejected"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Accepted != 1 {
+		t.Errorf("accepted=%d, want 1 (event still counted)", out.Accepted)
+	}
+	// State stays 'cancelled' (operator intent preserved).
+	if s := cmdState(t, "cid-race"); s != "cancelled" {
+		t.Errorf("state=%s, want cancelled (operator intent must persist)", s)
+	}
+	// Forensic audit must be present — the side effect actually occurred.
+	var auditN int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='command.executed_after_cancel' AND resource_id='cid-race'`).Scan(&auditN)
+	if auditN != 1 {
+		t.Errorf("command.executed_after_cancel audit entries=%d, want 1 (divergence must be visible in audit)", auditN)
+	}
+	// Audit detail must carry the agent-reported status so a forensic reader
+	// can reconstruct the divergence.
+	var details string
+	db.DB.QueryRow(`SELECT COALESCE(details, '') FROM audit_log WHERE action='command.executed_after_cancel' AND resource_id='cid-race'`).Scan(&details)
+	if details == "" || !contains(details, "succeeded") {
+		t.Errorf("audit details missing agent status: %q", details)
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 // TestEdgeEvents_CommandResultBadStatus_Rejected: any status other than
 // succeeded|failed|cancelled is rejected at parse stage.
 func TestEdgeEvents_CommandResultBadStatus_Rejected(t *testing.T) {

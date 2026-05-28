@@ -296,8 +296,40 @@ func postEdgeEvents(c *fiber.Ctx) error {
 						return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "audit write failed"})
 					}
 				}
-			} else if hardErr := tolerateBenign(commands.MarkTerminal(ctx, tx, e.CorrelationID, edgeID, p.Status, p.Message)); hardErr != nil {
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "command transition failed"})
+			} else {
+				// Terminal transition (succeeded|failed). If MarkTerminal's CAS
+				// misses because the row is already 'cancelled' (operator
+				// cancelled in the dispatch window after the Edge had already
+				// dispatched to the endpoint), record a forensic audit row
+				// instead of silently dropping the divergence. State stays
+				// 'cancelled' (operator intent is the displayed state); audit
+				// log records that the side effect actually occurred. Other
+				// CAS misses (already succeeded|failed, row owned by another
+				// Edge, row gone) remain benign idempotent no-ops.
+				switch terr := commands.MarkTerminal(ctx, tx, e.CorrelationID, edgeID, p.Status, p.Message); {
+				case terr == nil:
+					// Normal terminal transition applied.
+				case errors.Is(terr, commands.ErrInvalidTransition):
+					var st string
+					qerr := tx.QueryRowContext(ctx,
+						`SELECT state FROM command_queue WHERE correlation_id = $1 AND edge_id = $2`,
+						e.CorrelationID, edgeID,
+					).Scan(&st)
+					if qerr == nil && st == commands.StateCancelled {
+						details, _ := json.Marshal(map[string]string{
+							"agent_status":  p.Status,
+							"agent_message": p.Message,
+						})
+						if aerr := events.AuditLogSyncTx(tx, edgeID, "command.executed_after_cancel", "command", e.CorrelationID, string(details), ""); aerr != nil {
+							return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "audit write failed"})
+						}
+					}
+					// Other states fall through as benign no-op.
+				case errors.Is(terr, commands.ErrNotFound):
+					// Benign idempotent — row gone.
+				default:
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "command transition failed"})
+				}
 			}
 		default:
 			// F2 observational types (heartbeat/alert/inventory_summary/
