@@ -228,14 +228,16 @@ func TestMarkDeliveredToEdge_NotFound(t *testing.T) {
 	}
 }
 
-// TestMarkCancelled_PostPollDelivery_Succeeds_F4b: F4b restores Decision 6's
-// full cancel window. The F4a poll_delivered_at IS NULL guard is gone; the
-// Edge now learns about cancellations via cancelled_correlation_ids in the
-// poll response and drops the command between persist and dispatch. So
-// cancellation succeeds even after the command has been handed out in a poll
-// (state still 'queued', poll_delivered_at set) — the Edge's next poll picks
-// up the cancel signal.
-func TestMarkCancelled_PostPollDelivery_Succeeds_F4b(t *testing.T) {
+// TestMarkCancelled_RefusesPollDeliveredQueued: F4b keeps the F4a guard for
+// the race window between a queued command being included in a poll response
+// and the Edge acking it. In that window (state=queued, poll_delivered_at set,
+// not yet delivered_to_edge), the cancel signal in the just-built poll response
+// did NOT include this correlation_id (Vantage can't synchronously inject it
+// after the response is computed), so the Edge would dispatch and the
+// authoritative terminal result would CAS-miss a prematurely-terminal
+// cancelled row. The operator retries after the Edge acks (codex review of
+// PR #3, finding 3).
+func TestMarkCancelled_RefusesPollDeliveredQueued(t *testing.T) {
 	setupCommandsTest(t)
 	ctx := context.Background()
 	cid := enqueueOne(t)
@@ -244,14 +246,8 @@ func TestMarkCancelled_PostPollDelivery_Succeeds_F4b(t *testing.T) {
 	}
 	tx, _ := db.DB.BeginTx(ctx, nil)
 	defer func() { _ = tx.Rollback() }()
-	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
-		t.Fatalf("cancel of poll-delivered command: want nil (F4b cancel signal handles the race), got %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	if got := currentState(t, cid); got != StateCancelled {
-		t.Errorf("state after cancel=%s, want cancelled", got)
+	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel of poll-delivered queued command: want ErrNotCancellable (preserves race protection), got %v", err)
 	}
 }
 
@@ -274,6 +270,35 @@ func TestMarkCancelled_DeliveredToEdge_Succeeds_F4b(t *testing.T) {
 	}
 	if got := currentState(t, cid); got != StateCancelled {
 		t.Errorf("state after cancel=%s, want cancelled", got)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_IgnoresPollDelivered: the F4b
+// poll_delivered_at guard applies ONLY to state=queued (race protection for
+// in-flight poll deliveries). Once the Edge has acked into delivered_to_edge,
+// the command is locally persisted on the Edge and a fresh poll's
+// cancelled_correlation_ids signal handles the cancel safely; the
+// poll_delivered_at marker is irrelevant.
+func TestMarkCancelled_DeliveredToEdge_IgnoresPollDelivered(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	forceState(t, cid, StateDeliveredToEdge)
+	// Set poll_delivered_at as it would be in real life (atomic UPDATE during
+	// the poll that handed the command out). MarkCancelled must STILL succeed.
+	if _, err := db.DB.Exec(`UPDATE command_queue SET poll_delivered_at = $1 WHERE correlation_id = $2`, time.Now().Unix(), cid); err != nil {
+		t.Fatalf("set poll_delivered_at: %v", err)
+	}
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel of poll-delivered delivered_to_edge: want nil, got %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := currentState(t, cid); got != StateCancelled {
+		t.Errorf("state=%s, want cancelled", got)
 	}
 }
 

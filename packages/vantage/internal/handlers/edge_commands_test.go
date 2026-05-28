@@ -382,6 +382,91 @@ func TestEdgeEvents_CommandResultCancelled_Accepted(t *testing.T) {
 	}
 }
 
+// TestPoll_CancelSignal_BoundedByRetention: cancellations older than
+// cancelSignalRetentionSeconds (7 days) drop out of the cancel signal so the
+// poll response doesn't grow unbounded over a long-lived Edge (codex review
+// of PR #3, finding 4). A confirmed-and-old cancellation is no-op locally on
+// the Edge anyway, so dropping it has no correctness impact.
+func TestPoll_CancelSignal_BoundedByRetention(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	future := now + 3600
+	old := now - cancelSignalRetentionSeconds - 60 // just past the bound
+
+	seedQueuedCommand(t, "cid-recent", "tenant-x", "edge-1", "host-a", future)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-recent'`, now)
+
+	seedQueuedCommand(t, "cid-old", "tenant-x", "edge-1", "host-b", future)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-old'`, old)
+
+	resp := postEdgePoll(t, app, tok, pollBody())
+	defer resp.Body.Close()
+	var out struct {
+		CancelledCorrelationIDs []string `json:"cancelled_correlation_ids"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	got := map[string]bool{}
+	for _, c := range out.CancelledCorrelationIDs {
+		got[c] = true
+	}
+	if !got["cid-recent"] {
+		t.Error("recent cancellation missing from signal")
+	}
+	if got["cid-old"] {
+		t.Error("cancellation older than retention window included in signal (bandwidth leak)")
+	}
+}
+
+// TestEdgeEvents_CommandResultCancelled_RejectsUnowned: the cancel-confirmation
+// path skips MarkTerminal's edge-scoped CAS, so it must independently verify
+// the command belongs to the authenticated Edge AND is in cancelled state
+// before writing audit (codex review of PR #3, finding 2). Without this an Edge
+// could write audit rows against another Edge's commands or against
+// non-cancelled commands.
+func TestEdgeEvents_CommandResultCancelled_RejectsUnowned(t *testing.T) {
+	app := edgeFederationEnv(t)
+	_ = seedEdgeForPoll(t, "edge-A", "tenant-x", time.Hour)
+	tokB := seedEdgeForPoll(t, "edge-B", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	// A command owned by edge-A and cancelled.
+	seedQueuedCommand(t, "cid-A", "tenant-x", "edge-A", "host-a", now+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-A'`, now)
+	// A queued (non-cancelled) command owned by edge-B.
+	seedQueuedCommand(t, "cid-B-queued", "tenant-x", "edge-B", "host-b", now+3600)
+	// A bogus correlation_id with no row at all.
+	bogusID := "cid-does-not-exist"
+
+	// Edge-B tries to confirm cancellation for edge-A's command, for its own
+	// non-cancelled command, and for a non-existent id. All three must reject.
+	resp := postEdgeEventsHTTP(t, app, tokB, map[string]any{
+		"events": []map[string]any{
+			{"correlation_id": "cid-A", "type": "command.result", "occurred_at": now, "payload": map[string]string{"status": "cancelled", "message": "cross-edge"}},
+			{"correlation_id": "cid-B-queued", "type": "command.result", "occurred_at": now, "payload": map[string]string{"status": "cancelled", "message": "wrong-state"}},
+			{"correlation_id": bogusID, "type": "command.result", "occurred_at": now, "payload": map[string]string{"status": "cancelled", "message": "no-row"}},
+		},
+		"audit_chain_head": map[string]any{"seq": 1, "signature": "sig"},
+	})
+	defer resp.Body.Close()
+	var out struct {
+		Accepted int                       `json:"accepted"`
+		Rejected []map[string]any          `json:"rejected"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Accepted != 0 {
+		t.Errorf("accepted=%d, want 0 (all three should reject)", out.Accepted)
+	}
+	if len(out.Rejected) != 3 {
+		t.Errorf("rejected=%d, want 3 (cross-edge, wrong-state, no-row)", len(out.Rejected))
+	}
+	// Audit must NOT have written cancellation_confirmed for any of the three.
+	var auditN int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='command.cancellation_confirmed' AND resource_id IN ('cid-A','cid-B-queued',$1)`, bogusID).Scan(&auditN)
+	if auditN != 0 {
+		t.Errorf("cancellation_confirmed audit entries=%d, want 0 (ownership check failed)", auditN)
+	}
+}
+
 // TestEdgeEvents_CommandResultBadStatus_Rejected: any status other than
 // succeeded|failed|cancelled is rejected at parse stage.
 func TestEdgeEvents_CommandResultBadStatus_Rejected(t *testing.T) {

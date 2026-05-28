@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"vaporrmm/vantage/internal/commands"
 	"vaporrmm/vantage/internal/db"
@@ -106,6 +107,20 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 	return out, rows.Err()
 }
 
+// cancelSignalRetentionSeconds bounds how long a cancelled command stays in
+// the poll-response cancel signal. The Edge no-ops on unknown correlation_ids,
+// so the only cost of including an old cancellation is wire bytes; but with no
+// bound, every cancel for an Edge replays on every poll forever (codex review
+// of PR #3, finding 4).
+//
+// 7 days is much longer than any realistic Edge polling-lag scenario — an Edge
+// offline 7 days has bigger problems than missing an old cancellation, and the
+// command's underlying queued/delivered_to_edge row is long since reaped by
+// the TTL sweeper / a future retention sweep. If a precise ack signal lands
+// later (e.g. a cancel_acked_at column set by the cancellation_confirmed event
+// handler), this can shrink to "until confirmed" rather than the time bound.
+const cancelSignalRetentionSeconds = 7 * 24 * 60 * 60
+
 // fetchCancelledCorrelationIDs returns correlation_ids of commands the operator
 // cancelled while they were still pre-dispatch (state='cancelled' and never
 // reached delivered_to_endpoint). F4b includes these in the poll response so
@@ -117,19 +132,14 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 // delivered_to_endpoint transition fired, but the explicit NULL guard keeps
 // the cancel signal honest even if a future state-machine change widens the
 // cancel predicate.
-//
-// No time bound: an unacked cancellation will re-appear in every poll until
-// the row is reaped. The Edge no-ops on unknown correlation_ids, so the only
-// cost is wire bandwidth (a UUID per cancelled-but-unreaped row). The TTL
-// sweeper and an eventual command-retention sweep will bound this set in
-// practice; if it becomes hot, a `terminal_at > now - retention` filter is a
-// drop-in refinement.
 func fetchCancelledCorrelationIDs(edgeID string) ([]string, error) {
+	cutoff := time.Now().Unix() - cancelSignalRetentionSeconds
 	rows, err := db.DB.Query(`
 		SELECT correlation_id FROM command_queue
 		WHERE edge_id = $1
 		  AND state = 'cancelled'
-		  AND delivered_to_endpoint_at IS NULL`, edgeID)
+		  AND delivered_to_endpoint_at IS NULL
+		  AND terminal_at > $2`, edgeID, cutoff)
 	if err != nil {
 		return nil, err
 	}
