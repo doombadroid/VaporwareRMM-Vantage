@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"vaporrmm/vantage/internal/auth"
+	"vaporrmm/vantage/internal/commands"
 	"vaporrmm/vantage/internal/crypto"
 	"vaporrmm/vantage/internal/db"
 	"vaporrmm/vantage/internal/handlers"
@@ -100,10 +104,30 @@ func main() {
 	if p := os.Getenv("VANTAGE_PORT"); p != "" {
 		port = p
 	}
+
+	// Server-lifecycle context, cancelled on SIGINT/SIGTERM. Long-running
+	// background work (the command TTL sweeper) is tied to it so it stops
+	// cleanly on shutdown (F3 lesson). The sweeper is multi-node-safe — see
+	// commands.RunExpirySweeper.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go commands.RunExpirySweeper(ctx)
+
 	slog.Info("listening", "port", port)
-	if err := app.Listen(":" + port); err != nil {
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- app.Listen(":" + port) }()
+
+	select {
+	case err := <-serverErr:
+		// Listen returned on its own (e.g., port in use) — fatal.
 		slog.Error("server exited", "error", err)
 		os.Exit(1)
+	case <-ctx.Done():
+		slog.Info("shutdown signal received; draining")
+		if err := app.Shutdown(); err != nil {
+			slog.Error("graceful shutdown failed", "error", err)
+			os.Exit(1)
+		}
 	}
 }
 

@@ -37,11 +37,11 @@ func edgeFederationEnv(t *testing.T) *fiber.App {
 	t.Setenv("DATABASE_URL", url)
 
 	conn, _ := sql.Open("postgres", url)
-	_, _ = conn.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+	_, _ = conn.Exec(`DROP TABLE IF EXISTS command_queue, tags, tag_endpoint_membership, audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 	_ = conn.Close()
 	t.Cleanup(func() {
 		if db.DB != nil {
-			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS command_queue, tags, tag_endpoint_membership, audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 			_ = db.DB.Close()
 			db.DB = nil
 		}
@@ -1087,11 +1087,11 @@ func TestEdgePoll_StaleTokenDoesNotMutateState(t *testing.T) {
 	t.Setenv("DATABASE_URL", url)
 
 	conn, _ := sql.Open("postgres", url)
-	_, _ = conn.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+	_, _ = conn.Exec(`DROP TABLE IF EXISTS command_queue, tags, tag_endpoint_membership, audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 	_ = conn.Close()
 	t.Cleanup(func() {
 		if db.DB != nil {
-			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS command_queue, tags, tag_endpoint_membership, audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 			_ = db.DB.Close()
 			db.DB = nil
 		}

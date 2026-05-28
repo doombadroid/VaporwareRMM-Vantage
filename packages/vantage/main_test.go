@@ -60,11 +60,11 @@ func resetForTest(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	_, _ = conn.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+	_, _ = conn.Exec(`DROP TABLE IF EXISTS command_queue, tags, tag_endpoint_membership, audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 	_ = conn.Close()
 	t.Cleanup(func() {
 		if db.DB != nil {
-			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
+			_, _ = db.DB.Exec(`DROP TABLE IF EXISTS command_queue, tags, tag_endpoint_membership, audit_checkpoints, enrollment_tokens, vantage_signing_key, tailscale_connection, audit_log, user_sessions, users, edges, schema_migrations CASCADE`)
 			_ = db.DB.Close()
 			db.DB = nil
 		}
