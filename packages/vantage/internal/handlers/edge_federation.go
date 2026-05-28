@@ -323,6 +323,19 @@ func postEdgeEvents(c *fiber.Ctx) error {
 						if aerr := events.AuditLogSyncTx(tx, edgeID, "command.executed_after_cancel", "command", e.CorrelationID, string(details), ""); aerr != nil {
 							return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "audit write failed"})
 						}
+						// Confirm the cancellation so it stops replaying in
+						// the cancel signal (codex round 6 #3). The Edge has
+						// already dispatched and will never send a separate
+						// command.cancellation_confirmed for this row, so the
+						// terminal result IS the confirmation that the cancel
+						// signal is no longer relevant for this Edge.
+						if _, uerr := tx.ExecContext(ctx,
+							`UPDATE command_queue SET cancellation_confirmed_at = $1
+							 WHERE correlation_id = $2 AND edge_id = $3 AND cancellation_confirmed_at IS NULL`,
+							time.Now().Unix(), e.CorrelationID, edgeID,
+						); uerr != nil {
+							return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "cancellation confirm update failed"})
+						}
 					}
 					// Other states fall through as benign no-op.
 				case errors.Is(terr, commands.ErrNotFound):
@@ -625,33 +638,40 @@ func pollEdge(c *fiber.Ctx) error {
 	//     surfaces the degraded state to the Edge so it can skip dispatch
 	//     for any commands it already has locally too (codex round 4 #3).
 	//   - Both succeed: both lists are returned; cancel_signal_complete=true.
-	pendingCommands, cerr := fetchPendingCommands(edgeID, time.Now().Unix())
+	pollNow := time.Now().Unix()
+	pendingCommands, cerr := fetchPendingCommands(edgeID, pollNow)
 	if cerr != nil {
 		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
 		pendingCommands = []pollCommandDTO{}
 	}
 	cancelledIDs, cancelTruncated, ccerr := fetchCancelledCorrelationIDs(edgeID)
 	cancelSignalComplete := ccerr == nil && !cancelTruncated
-	if ccerr != nil {
-		slog.Error("poll: fetch cancelled correlation_ids", "error", ccerr, "edge_id", edgeID)
-		cancelledIDs = []string{}
-		// Withhold commands when the cancel signal cannot be assembled — the
-		// Edge would otherwise dispatch a command that may have been
-		// operator-cancelled in the same poll cycle (codex round 4 #3).
-		// Stamped poll_delivered_at markers persist but the row is reachable
-		// again on the next poll's atomic SELECT (the WHERE matches
-		// state=queued regardless of marker).
-		pendingCommands = []pollCommandDTO{}
-	} else if cancelTruncated {
-		// Truncated batch (more than maxCancelSignalBatch unconfirmed): the
-		// remaining cancellations did not ship in this response, so the Edge
-		// MUST NOT dispatch any locally-persisted commands this cycle — one
-		// of them may be operator-cancelled but its correlation_id sits in
-		// the omitted tail (codex round 5 #1). Surface via
-		// cancel_signal_complete=false and zero the commands list. The Edge
-		// will see cancellations next cycle as it confirms the current batch
-		// and the backlog drains.
-		slog.Info("poll: cancel signal batch truncated", "edge_id", edgeID, "delivered", len(cancelledIDs), "limit", maxCancelSignalBatch)
+	if ccerr != nil || cancelTruncated {
+		if ccerr != nil {
+			slog.Error("poll: fetch cancelled correlation_ids", "error", ccerr, "edge_id", edgeID)
+			cancelledIDs = []string{}
+		} else {
+			slog.Info("poll: cancel signal batch truncated", "edge_id", edgeID, "delivered", len(cancelledIDs), "limit", maxCancelSignalBatch)
+		}
+		// Withhold commands when the cancel signal is degraded — the Edge
+		// would otherwise dispatch a command that may have been
+		// operator-cancelled in the same poll cycle (codex round 4 #3,
+		// round 5 #1). Un-stamp the rows we just stamped this poll so
+		// MarkCancelled's queued+IS NULL guard does not lock out the
+		// operator until the next delivery (codex round 6 #1). The
+		// poll_delivered_at = $2 match catches only the stamps that this
+		// poll's COALESCE wrote (rows that had no prior stamp); previous
+		// stamps from earlier polls are preserved.
+		for _, cmd := range pendingCommands {
+			if _, uerr := db.DB.Exec(
+				`UPDATE command_queue SET poll_delivered_at = NULL
+				 WHERE correlation_id = $1 AND state = 'queued' AND poll_delivered_at = $2`,
+				cmd.CorrelationID, pollNow,
+			); uerr != nil {
+				slog.Warn("poll: un-stamp poll_delivered_at on withhold",
+					"error", uerr, "correlation_id", cmd.CorrelationID, "edge_id", edgeID)
+			}
+		}
 		pendingCommands = []pollCommandDTO{}
 	}
 	resp := fiber.Map{
