@@ -233,15 +233,116 @@ func postEdgeEvents(c *fiber.Ctx) error {
 				Status  string `json:"status"`
 				Message string `json:"message"`
 			}
-			if jerr := json.Unmarshal(e.Payload, &p); jerr != nil || (p.Status != commands.StateSucceeded && p.Status != commands.StateFailed) {
+			if jerr := json.Unmarshal(e.Payload, &p); jerr != nil || (p.Status != commands.StateSucceeded && p.Status != commands.StateFailed && p.Status != commands.StateCancelled) {
 				rejected = append(rejected, rejection{
 					CorrelationID: e.CorrelationID,
-					Reason:        "command.result payload must carry status succeeded|failed",
+					Reason:        "command.result payload must carry status succeeded|failed|cancelled",
 				})
 				continue
 			}
-			if hardErr := tolerateBenign(commands.MarkTerminal(ctx, tx, e.CorrelationID, edgeID, p.Status, p.Message)); hardErr != nil {
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "command transition failed"})
+			if p.Status == commands.StateCancelled {
+				// F4b cancel-signal confirmation: the Edge dropped the command in
+				// response to a cancelled_correlation_ids signal. Vantage's row is
+				// already state='cancelled' (operator initiated; that's what
+				// generated the signal in the first place), so no MarkTerminal
+				// call — state is already correct.
+				//
+				// Idempotent confirmation via cancellation_confirmed_at (codex
+				// review of PR #3 round 2 #2 + #6): a single atomic UPDATE that
+				// CAS-sets cancellation_confirmed_at NULL→now AND is edge-scoped
+				// AND requires state='cancelled'. RowsAffected==1 means we won
+				// and we write the audit row; RowsAffected==0 covers:
+				//   - row doesn't exist or wrong edge or non-cancelled state
+				//     (unowned/wrong-state — reject the event)
+				//   - row already confirmed (idempotent retry — benign no-op,
+				//     accepted without a duplicate audit row)
+				// We distinguish those with a follow-up SELECT inside the same
+				// tx (sees post-UPDATE snapshot).
+				now := time.Now().Unix()
+				res, uerr := tx.ExecContext(ctx, `
+					UPDATE command_queue
+					SET cancellation_confirmed_at = $3
+					WHERE correlation_id = $1
+					  AND edge_id = $2
+					  AND state = 'cancelled'
+					  AND cancellation_confirmed_at IS NULL`,
+					e.CorrelationID, edgeID, now)
+				if uerr != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "cancel-confirmation update failed"})
+				}
+				ra, _ := res.RowsAffected()
+				if ra == 0 {
+					var alreadyConfirmed bool
+					if qerr := tx.QueryRowContext(ctx,
+						`SELECT EXISTS (
+							SELECT 1 FROM command_queue
+							WHERE correlation_id = $1 AND edge_id = $2
+							  AND state = 'cancelled' AND cancellation_confirmed_at IS NOT NULL
+						)`,
+						e.CorrelationID, edgeID,
+					).Scan(&alreadyConfirmed); qerr != nil {
+						return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "cancel-confirmation lookup failed"})
+					}
+					if !alreadyConfirmed {
+						rejected = append(rejected, rejection{
+							CorrelationID: e.CorrelationID,
+							Reason:        "cancel-confirmation for unowned or non-cancelled command",
+						})
+						continue
+					}
+					// Already confirmed; idempotent no-op (no duplicate audit).
+				} else {
+					if aerr := events.AuditLogSyncTx(tx, edgeID, "command.cancellation_confirmed", "command", e.CorrelationID, p.Message, ""); aerr != nil {
+						return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "audit write failed"})
+					}
+				}
+			} else {
+				// Terminal transition (succeeded|failed). If MarkTerminal's CAS
+				// misses because the row is already 'cancelled' (operator
+				// cancelled in the dispatch window after the Edge had already
+				// dispatched to the endpoint), record a forensic audit row
+				// instead of silently dropping the divergence. State stays
+				// 'cancelled' (operator intent is the displayed state); audit
+				// log records that the side effect actually occurred. Other
+				// CAS misses (already succeeded|failed, row owned by another
+				// Edge, row gone) remain benign idempotent no-ops.
+				switch terr := commands.MarkTerminal(ctx, tx, e.CorrelationID, edgeID, p.Status, p.Message); {
+				case terr == nil:
+					// Normal terminal transition applied.
+				case errors.Is(terr, commands.ErrInvalidTransition):
+					var st string
+					qerr := tx.QueryRowContext(ctx,
+						`SELECT state FROM command_queue WHERE correlation_id = $1 AND edge_id = $2`,
+						e.CorrelationID, edgeID,
+					).Scan(&st)
+					if qerr == nil && st == commands.StateCancelled {
+						details, _ := json.Marshal(map[string]string{
+							"agent_status":  p.Status,
+							"agent_message": p.Message,
+						})
+						if aerr := events.AuditLogSyncTx(tx, edgeID, "command.executed_after_cancel", "command", e.CorrelationID, string(details), ""); aerr != nil {
+							return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "audit write failed"})
+						}
+						// Confirm the cancellation so it stops replaying in
+						// the cancel signal (codex round 6 #3). The Edge has
+						// already dispatched and will never send a separate
+						// command.cancellation_confirmed for this row, so the
+						// terminal result IS the confirmation that the cancel
+						// signal is no longer relevant for this Edge.
+						if _, uerr := tx.ExecContext(ctx,
+							`UPDATE command_queue SET cancellation_confirmed_at = $1
+							 WHERE correlation_id = $2 AND edge_id = $3 AND cancellation_confirmed_at IS NULL`,
+							time.Now().Unix(), e.CorrelationID, edgeID,
+						); uerr != nil {
+							return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "cancellation confirm update failed"})
+						}
+					}
+					// Other states fall through as benign no-op.
+				case errors.Is(terr, commands.ErrNotFound):
+					// Benign idempotent — row gone.
+				default:
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "command transition failed"})
+				}
 			}
 		default:
 			// F2 observational types (heartbeat/alert/inventory_summary/
@@ -332,6 +433,14 @@ func pollEdge(c *fiber.Ctx) error {
 			Seq       int64  `json:"seq"`
 			Signature string `json:"signature"`
 		} `json:"audit_chain_head"`
+		// SupportsCancelSignal: the Edge advertises that it honors
+		// cancelled_correlation_ids on every poll cycle (persist→cancel-check→
+		// dispatch ordering). Required for the operator-cancel widening from
+		// delivered_to_edge — without it MarkCancelled refuses the wider
+		// window (codex review of PR #3 round 2 #5). Pre-F4b Edges (and any
+		// non-conformant implementation) omit the field, which decodes to
+		// false, keeping them on queued-only cancellation.
+		SupportsCancelSignal bool `json:"supports_cancel_signal"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
@@ -438,10 +547,37 @@ func pollEdge(c *fiber.Ctx) error {
 		newPlain, newExpires = np, ne
 	}
 
-	// 3c. Refresh reported edge_version. Inside the tx so a
-	// failure rolls back any rotation just performed.
-	if _, err := tx.Exec(`UPDATE edges SET edge_version = $1 WHERE id = $2`, req.EdgeVersion, edgeID); err != nil {
-		slog.Error("poll: edge_version update", "error", err, "edge_id", edgeID)
+	// 3c. Refresh reported edge_version and cancel-signal capability. Inside
+	// the tx so a failure rolls back any rotation just performed.
+	//
+	// Capability downgrade guard (codex review of PR #3 round 5 #2): if the
+	// edge currently advertises supports_cancel_signal=true AND has
+	// unconfirmed cancellations sitting in command_queue, refuse the
+	// downgrade — keep the flag true. A downgraded Edge would not understand
+	// cancelled_correlation_ids and could dispatch a locally-persisted
+	// command that Vantage already terminal-cancelled. The CASE preserves
+	// the flag in that exact window; once the Edge confirms all outstanding
+	// cancellations, a subsequent poll with supports_cancel_signal=false
+	// drops the flag cleanly.
+	if _, err := tx.Exec(`
+		UPDATE edges
+		SET edge_version = $1,
+		    supports_cancel_signal = CASE
+		        WHEN supports_cancel_signal = true
+		         AND $2 = false
+		         AND EXISTS (
+		             SELECT 1 FROM command_queue
+		             WHERE edge_id = edges.id
+		               AND state = 'cancelled'
+		               AND delivered_to_endpoint_at IS NULL
+		               AND cancellation_confirmed_at IS NULL
+		         ) THEN true
+		        ELSE $2
+		    END
+		WHERE id = $3`,
+		req.EdgeVersion, req.SupportsCancelSignal, edgeID,
+	); err != nil {
+		slog.Error("poll: edge_version/capability update", "error", err, "edge_id", edgeID)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "edge_version update failed"})
 	}
 
@@ -474,17 +610,68 @@ func pollEdge(c *fiber.Ctx) error {
 	}
 
 	// ---- Phase 4: response ----
-	// Pending commands for this Edge (F4a). Read AFTER commit: poll never
-	// mutates command state (that happens on ack), so a committed read is
-	// correct and avoids holding the edges-row lock across the scan. A read
-	// error here must NOT fail the poll — the token rotation is already
-	// durable; degrade to an empty command set and the Edge retries next poll.
-	// Fresh timestamp (NOT the pre-lock nowUnix): if the poll blocked on the
-	// edges FOR UPDATE lock or commit, a stale value could let a near-expiry
-	// command slip past the grace filter (codex round 3 #4).
-	pendingCommands, cerr := fetchPendingCommands(edgeID, time.Now().Unix())
+	// Pending commands AND the F4b cancellation signal must both be assembled
+	// safely. Read AFTER commit (poll does not mutate command state — that
+	// happens on ack — so a committed read is correct and avoids holding the
+	// edges-row lock across the scan). Fresh timestamp (NOT the pre-lock
+	// nowUnix): if the poll blocked on the edges FOR UPDATE lock or commit,
+	// a stale value could let a near-expiry command slip past the grace
+	// filter (codex round 3 #4).
+	//
+	// Order: fetchPendingCommands FIRST, fetchCancelledCorrelationIDs SECOND
+	// (codex review of PR #3 round 4 #1). fetchPendingCommands' atomic
+	// SELECT FOR UPDATE / UPDATE…RETURNING acquires a row lock; any concurrent
+	// MarkCancelled blocks on that lock and proceeds only after our statement
+	// commits. The subsequent cancelled read therefore observes any cancel
+	// that was racing the poll (post-lock-release), closing the bulk of the
+	// poll-build-vs-cancel window. A small residual race remains between the
+	// cancelled read and the HTTP response landing at the Edge — fundamental
+	// to the eventual-consistency model without an out-of-band cancel ack
+	// (forbidden by #22 Decision 1's outbound-only constraint).
+	//
+	// Failure handling:
+	//   - Commands fetch fails: pendingCommands = [], cancelled fetch still
+	//     runs. Rows are NOT stamped (atomic UPDATE rolled back).
+	//   - Cancelled fetch fails: signal is incomplete. We additionally zero
+	//     pendingCommands so the Edge does not dispatch a (possibly cancelled)
+	//     command without an authoritative signal. cancel_signal_complete=false
+	//     surfaces the degraded state to the Edge so it can skip dispatch
+	//     for any commands it already has locally too (codex round 4 #3).
+	//   - Both succeed: both lists are returned; cancel_signal_complete=true.
+	pollNow := time.Now().Unix()
+	pendingCommands, cerr := fetchPendingCommands(edgeID, pollNow)
 	if cerr != nil {
 		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
+		pendingCommands = []pollCommandDTO{}
+	}
+	cancelledIDs, cancelTruncated, ccerr := fetchCancelledCorrelationIDs(edgeID)
+	cancelSignalComplete := ccerr == nil && !cancelTruncated
+	if ccerr != nil || cancelTruncated {
+		if ccerr != nil {
+			slog.Error("poll: fetch cancelled correlation_ids", "error", ccerr, "edge_id", edgeID)
+			cancelledIDs = []string{}
+		} else {
+			slog.Info("poll: cancel signal batch truncated", "edge_id", edgeID, "delivered", len(cancelledIDs), "limit", maxCancelSignalBatch)
+		}
+		// Withhold commands when the cancel signal is degraded — the Edge
+		// would otherwise dispatch a command that may have been
+		// operator-cancelled in the same poll cycle (codex round 4 #3,
+		// round 5 #1). Un-stamp the rows we just stamped this poll so
+		// MarkCancelled's queued+IS NULL guard does not lock out the
+		// operator until the next delivery (codex round 6 #1). The
+		// poll_delivered_at = $2 match catches only the stamps that this
+		// poll's COALESCE wrote (rows that had no prior stamp); previous
+		// stamps from earlier polls are preserved.
+		for _, cmd := range pendingCommands {
+			if _, uerr := db.DB.Exec(
+				`UPDATE command_queue SET poll_delivered_at = NULL
+				 WHERE correlation_id = $1 AND state = 'queued' AND poll_delivered_at = $2`,
+				cmd.CorrelationID, pollNow,
+			); uerr != nil {
+				slog.Warn("poll: un-stamp poll_delivered_at on withhold",
+					"error", uerr, "correlation_id", cmd.CorrelationID, "edge_id", edgeID)
+			}
+		}
 		pendingCommands = []pollCommandDTO{}
 	}
 	resp := fiber.Map{
@@ -494,6 +681,14 @@ func pollEdge(c *fiber.Ctx) error {
 			"signature": vantageSig,
 		},
 		"commands":                  pendingCommands,
+		"cancelled_correlation_ids": cancelledIDs,
+		// cancel_signal_complete (codex round 4 #3): true iff the cancellation
+		// signal in this response is authoritative. false means
+		// fetchCancelledCorrelationIDs errored; the Edge MUST NOT dispatch
+		// any pending local command this cycle (a row may have been operator-
+		// cancelled and the signal lost the carrier). Edge resumes dispatch
+		// on the next poll where cancel_signal_complete is true.
+		"cancel_signal_complete":    cancelSignalComplete,
 		"next_poll_after_seconds":   defaultPollIntervalSeconds,
 		"min_required_edge_version": minimum,
 	}

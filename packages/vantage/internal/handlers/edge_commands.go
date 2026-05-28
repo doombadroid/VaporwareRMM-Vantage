@@ -71,9 +71,16 @@ type pollCommandDTO struct {
 //   - queued-first ordering under the LIMIT (codex round 2 #5), so a backlog
 //     of stuck redeliveries can't starve newly queued commands.
 //
-// COALESCE keeps the FIRST poll_delivered_at (the marker means "first handed
-// out"); the RETURNING order is unspecified but irrelevant (the Edge
-// processes every command).
+// poll_delivered_at uses COALESCE so the marker is set on the first hand-out
+// and never updated — it gates the cancel-vs-poll race for queued rows. The
+// cancel-vs-poll race for delivered_to_edge is closed by a stabilization
+// window on delivered_to_edge_at in MarkCancelled (codex review of PR #3
+// round 3 #1), not by refreshing a poll-time marker on every re-delivery: a
+// re-polled marker would always be fresh for an actively-polling Edge and
+// the cancel widening would never trigger.
+//
+// The RETURNING order is unspecified but irrelevant (the Edge processes every
+// command).
 func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error) {
 	rows, err := db.DB.Query(`
 		WITH picked AS (
@@ -104,6 +111,72 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 		out = append(out, cmd)
 	}
 	return out, rows.Err()
+}
+
+// maxCancelSignalBatch bounds one poll's cancel signal so an Edge with a
+// large unconfirmed backlog (offline, slow to confirm, or buggy) doesn't blow
+// the response past proxy/client limits and starve itself of the signal
+// entirely (codex review of PR #3 round 4 #4). 200 matches the headroom on
+// the commands cap (50) and lets a typical Edge drain a backlog over a few
+// poll cycles — Edge confirms each delivered cancellation via
+// command.result(cancelled), the corresponding row drops out, and the next
+// poll surfaces the next batch.
+const maxCancelSignalBatch = 200
+
+// fetchCancelledCorrelationIDs returns correlation_ids of commands the operator
+// cancelled while they were still pre-dispatch (state='cancelled' and never
+// reached delivered_to_endpoint) AND that this Edge has not yet acknowledged
+// via command.result(status=cancelled). F4b includes these in the poll
+// response so the Edge can drop them between persist and dispatch (Decision 6
+// cancel window restoration; see commands.MarkCancelled).
+//
+// Filtering on cancellation_confirmed_at IS NULL (codex review of PR #3 round
+// 2 #6) replaces the round-1 7-day retention bound: an Edge offline longer
+// than the retention window would otherwise lose its signal and dispatch a
+// local 'received' row that Vantage has terminal-cancelled. Now an unconfirmed
+// cancellation stays in the signal indefinitely; the Edge confirms via the
+// cancellation_confirmed event and the row drops out.
+//
+// delivered_to_endpoint_at IS NULL is belt-and-suspenders: MarkCancelled's
+// state predicate already implies no delivered_to_endpoint transition fired,
+// but the explicit NULL guard keeps the cancel signal honest even if a future
+// state-machine change widens the cancel predicate. ORDER BY terminal_at ASC
+// drains oldest cancellations first so a long backlog converges deterministically.
+//
+// Truncation reporting (codex review of PR #3 round 5 #1): the query fetches
+// maxCancelSignalBatch+1 rows so the caller can detect a truncated batch. The
+// returned ids are bounded to maxCancelSignalBatch; truncated=true means the
+// Edge has at least one more unconfirmed cancellation that this poll did not
+// carry. The caller MUST surface this as cancel_signal_complete=false so the
+// Edge withholds dispatch until the next poll drains more of the backlog.
+func fetchCancelledCorrelationIDs(edgeID string) (ids []string, truncated bool, err error) {
+	rows, qerr := db.DB.Query(`
+		SELECT correlation_id FROM command_queue
+		WHERE edge_id = $1
+		  AND state = 'cancelled'
+		  AND delivered_to_endpoint_at IS NULL
+		  AND cancellation_confirmed_at IS NULL
+		ORDER BY terminal_at ASC
+		LIMIT $2`, edgeID, maxCancelSignalBatch+1)
+	if qerr != nil {
+		return nil, false, qerr
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var cid string
+		if scanErr := rows.Scan(&cid); scanErr != nil {
+			return nil, false, scanErr
+		}
+		out = append(out, cid)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return nil, false, rerr
+	}
+	if len(out) > maxCancelSignalBatch {
+		return out[:maxCancelSignalBatch], true, nil
+	}
+	return out, false, nil
 }
 
 func postEdgeCommandsAck(c *fiber.Ctx) error {

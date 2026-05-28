@@ -57,7 +57,7 @@ func setupCommandsTest(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id, email, password_hash, role) VALUES ('op1', 'op@test.local', 'x', 'super_admin')`); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
-	if _, err := db.DB.Exec(`INSERT INTO edges (id, name, tenant_id, status, created_at) VALUES ('edge1', 'Edge', 'tenant1', 'active', $1)`, now); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO edges (id, name, tenant_id, status, created_at, supports_cancel_signal) VALUES ('edge1', 'Edge', 'tenant1', 'active', $1, true)`, now); err != nil {
 		t.Fatalf("seed edge: %v", err)
 	}
 }
@@ -90,11 +90,22 @@ func enqueueOne(t *testing.T) string {
 
 // forceState raw-sets a command's state for fixture construction (bypasses
 // the lifecycle deliberately — we are constructing the "from" state under
-// test, not exercising the path to it).
+// test, not exercising the path to it). Also populates the state-associated
+// _at column where transitions would normally set it, so guards that read
+// those columns (e.g. MarkCancelled's stabilization window on
+// delivered_to_edge_at) see realistic fixtures.
 func forceState(t *testing.T, cid, state string) {
 	t.Helper()
 	if _, err := db.DB.Exec(`UPDATE command_queue SET state = $2 WHERE correlation_id = $1`, cid, state); err != nil {
 		t.Fatalf("force state %s: %v", state, err)
+	}
+	switch state {
+	case StateDeliveredToEdge:
+		// Outside CancelStabilizationSeconds so MarkCancelled allows.
+		past := time.Now().Unix() - CancelStabilizationSeconds - 60
+		if _, err := db.DB.Exec(`UPDATE command_queue SET delivered_to_edge_at=$1 WHERE correlation_id=$2`, past, cid); err != nil {
+			t.Fatalf("force delivered_to_edge_at: %v", err)
+		}
 	}
 }
 
@@ -158,7 +169,10 @@ func TestCommandLifecycle_AllTransitions(t *testing.T) {
 		},
 		{
 			name: "MarkCancelled", toState: StateCancelled,
-			legalFrom: map[string]bool{StateQueued: true}, missErr: ErrNotCancellable,
+			// F4b restores Decision 6's full window: cancel is legal from queued
+			// AND delivered_to_edge (the F4a-narrowed queued-only set is gone,
+			// the cancel signal in the poll response handles the race).
+			legalFrom: map[string]bool{StateQueued: true, StateDeliveredToEdge: true}, missErr: ErrNotCancellable,
 			apply: func(tx *sql.Tx, cid string) error { return MarkCancelled(ctx, tx, cid, "op1") },
 		},
 	}
@@ -225,10 +239,16 @@ func TestMarkDeliveredToEdge_NotFound(t *testing.T) {
 	}
 }
 
-// TestMarkCancelled_RefusesPollDelivered: once a command has been handed out
-// in a poll (poll_delivered_at set), cancellation is refused even while the
-// row is still 'queued' (codex round 3 #1) — the Edge may already run it.
-func TestMarkCancelled_RefusesPollDelivered(t *testing.T) {
+// TestMarkCancelled_RefusesPollDeliveredQueued: F4b keeps the F4a guard for
+// the race window between a queued command being included in a poll response
+// and the Edge acking it. In that window (state=queued, poll_delivered_at set,
+// not yet delivered_to_edge), the cancel signal in the just-built poll response
+// did NOT include this correlation_id (Vantage can't synchronously inject it
+// after the response is computed), so the Edge would dispatch and the
+// authoritative terminal result would CAS-miss a prematurely-terminal
+// cancelled row. The operator retries after the Edge acks (codex review of
+// PR #3, finding 3).
+func TestMarkCancelled_RefusesPollDeliveredQueued(t *testing.T) {
 	setupCommandsTest(t)
 	ctx := context.Background()
 	cid := enqueueOne(t)
@@ -236,9 +256,213 @@ func TestMarkCancelled_RefusesPollDelivered(t *testing.T) {
 		t.Fatalf("mark poll-delivered: %v", err)
 	}
 	tx, _ := db.DB.BeginTx(ctx, nil)
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
-		t.Fatalf("cancel of poll-delivered command: want ErrNotCancellable, got %v", err)
+		t.Fatalf("cancel of poll-delivered queued command: want ErrNotCancellable (preserves race protection), got %v", err)
+	}
+}
+
+// agedDeliveredToEdge force-sets state to delivered_to_edge with
+// delivered_to_edge_at set far enough in the past that the
+// CancelStabilizationSeconds window has elapsed. Used by tests that exercise
+// the F4b delivered_to_edge cancel path.
+func agedDeliveredToEdge(t *testing.T, cid string) {
+	t.Helper()
+	past := time.Now().Unix() - CancelStabilizationSeconds - 60
+	if _, err := db.DB.Exec(
+		`UPDATE command_queue SET state='delivered_to_edge', delivered_to_edge_at=$1 WHERE correlation_id=$2`,
+		past, cid,
+	); err != nil {
+		t.Fatalf("force aged delivered_to_edge: %v", err)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_Succeeds_F4b: cancel is legal from
+// delivered_to_edge under F4b (Decision 6 full window) when the Edge has
+// advertised cancel-signal support AND the stabilization window has elapsed
+// since delivered_to_edge_at. The Edge has the command locally in its
+// 'received' state, the cancel signal in the next poll response tells it to
+// drop the command before dispatch.
+func TestMarkCancelled_DeliveredToEdge_Succeeds_F4b(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	agedDeliveredToEdge(t, cid)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel of delivered_to_edge command: want nil (F4b restored window), got %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := currentState(t, cid); got != StateCancelled {
+		t.Errorf("state after cancel=%s, want cancelled", got)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_IgnoresPollDelivered: the F4b
+// poll_delivered_at guard applies ONLY to state=queued (race protection for
+// in-flight poll deliveries). Once the Edge has acked into delivered_to_edge,
+// the command is locally persisted on the Edge and a fresh poll's
+// cancelled_correlation_ids signal handles the cancel safely; the
+// poll_delivered_at marker is irrelevant.
+func TestMarkCancelled_DeliveredToEdge_IgnoresPollDelivered(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	agedDeliveredToEdge(t, cid)
+	// Set poll_delivered_at as it would be in real life (atomic UPDATE during
+	// the poll that handed the command out). MarkCancelled must STILL succeed.
+	if _, err := db.DB.Exec(`UPDATE command_queue SET poll_delivered_at = $1 WHERE correlation_id = $2`, time.Now().Unix(), cid); err != nil {
+		t.Fatalf("set poll_delivered_at: %v", err)
+	}
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel of poll-delivered delivered_to_edge: want nil, got %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := currentState(t, cid); got != StateCancelled {
+		t.Errorf("state=%s, want cancelled", got)
+	}
+}
+
+// TestMarkCancelled_QueuedAutoConfirms: a queued cancellation where the Edge
+// never received the row (poll_delivered_at IS NULL) sets
+// cancellation_confirmed_at at cancel time. The signal is bounded — nothing
+// for the Edge to confirm, so no replay (codex review of PR #3 round 3 #3).
+func TestMarkCancelled_QueuedAutoConfirms(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel queued: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var confirmed sql.NullInt64
+	if err := db.DB.QueryRow(`SELECT cancellation_confirmed_at FROM command_queue WHERE correlation_id = $1`, cid).Scan(&confirmed); err != nil {
+		t.Fatalf("read confirmation: %v", err)
+	}
+	if !confirmed.Valid {
+		t.Error("queued cancellation should auto-confirm (Edge never had it)")
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_DoesNotAutoConfirm: when the Edge has the
+// row locally (delivered_to_edge), cancellation_confirmed_at stays NULL until
+// the Edge sends command.result(cancelled). The signal must persist so a
+// retrying / restarted Edge sees the drop.
+func TestMarkCancelled_DeliveredToEdge_DoesNotAutoConfirm(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	agedDeliveredToEdge(t, cid)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel delivered_to_edge: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	var confirmed sql.NullInt64
+	if err := db.DB.QueryRow(`SELECT cancellation_confirmed_at FROM command_queue WHERE correlation_id = $1`, cid).Scan(&confirmed); err != nil {
+		t.Fatalf("read confirmation: %v", err)
+	}
+	if confirmed.Valid {
+		t.Error("delivered_to_edge cancellation must NOT auto-confirm — Edge needs to confirm the drop")
+	}
+}
+
+// TestMarkCancelled_DeliveredToEndpoint_Refuses: post-dispatch is still off
+// limits (Decision 6 — command runs to completion, terminal result is
+// authoritative). The state-table forcing test also covers this; this case is
+// called out explicitly because it is the cutoff edge F4b deliberately keeps.
+func TestMarkCancelled_DeliveredToEndpoint_Refuses(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	forceState(t, cid, StateDeliveredToEndpoint)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel of delivered_to_endpoint: want ErrNotCancellable, got %v", err)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_RequiresCancelSignalSupport: F4b widening
+// only kicks in for Edges that have advertised cancel-signal support in their
+// poll request (codex review of PR #3 round 2 #5). An Edge whose
+// supports_cancel_signal is false (default for pre-F4b Edges or those that
+// have not yet polled) keeps the F4a-narrow queued-only behavior; cancel from
+// delivered_to_edge refuses.
+func TestMarkCancelled_DeliveredToEdge_RequiresCancelSignalSupport(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	// setupCommandsTest seeds edge1 with supports_cancel_signal=true; flip it
+	// to simulate a non-advertising Edge.
+	if _, err := db.DB.Exec(`UPDATE edges SET supports_cancel_signal = false WHERE id='edge1'`); err != nil {
+		t.Fatalf("flip supports_cancel_signal: %v", err)
+	}
+	cid := enqueueOne(t)
+	forceState(t, cid, StateDeliveredToEdge)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel without cancel-signal support: want ErrNotCancellable, got %v", err)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_RefusesWithinStabilization: the F4b
+// cancel-vs-poll race for delivered_to_edge (codex review of PR #3 round 2
+// #1) is closed by a stabilization window on delivered_to_edge_at. Inside
+// the window (< CancelStabilizationSeconds since Edge ack), MarkCancelled
+// refuses — the Edge may be mid-dispatch and the in-flight
+// command.delivered_to_endpoint event has not reached Vantage yet. The
+// operator retries after the window elapses.
+func TestMarkCancelled_DeliveredToEdge_RefusesWithinStabilization(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	// Set state with delivered_to_edge_at = "just now" — inside the window.
+	if _, err := db.DB.Exec(
+		`UPDATE command_queue SET state='delivered_to_edge', delivered_to_edge_at=$1 WHERE correlation_id=$2`,
+		time.Now().Unix(), cid,
+	); err != nil {
+		t.Fatalf("set delivered_to_edge: %v", err)
+	}
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel during stabilization window: want ErrNotCancellable, got %v", err)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_AllowsAfterStabilization: once the window
+// has elapsed, delivered_to_edge cancellation succeeds — no stuck-state where
+// the Edge crashed before dispatching and the row can never be cancelled.
+func TestMarkCancelled_DeliveredToEdge_AllowsAfterStabilization(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	agedDeliveredToEdge(t, cid)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel after stabilization window: want nil, got %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := currentState(t, cid); got != StateCancelled {
+		t.Errorf("state=%s, want cancelled", got)
 	}
 }
 
