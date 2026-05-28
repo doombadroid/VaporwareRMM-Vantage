@@ -3,7 +3,7 @@
 // dispatches it to an endpoint; results flow back. Vantage owns the
 // authoritative queue and the operator-facing state (issue #22 Q1/Q4/Q5).
 //
-// State machine (Decision 6 adds "cancelled"):
+// State machine (Decision 6 adds "cancelled"; F4b restores the full cancel window):
 //
 //	queued ──► delivered_to_edge ──► delivered_to_endpoint ──► executing
 //	                                          │                    │
@@ -12,6 +12,15 @@
 //	                                           succeeded | failed
 //	queued ──► expired                       (TTL sweep, edge_unreachable)
 //	queued | delivered_to_edge ──► cancelled (operator, pre-dispatch only)
+//
+// Cancel window (Decision 6 / F4b cancel-signal): cancellation is legal up to
+// and including delivered_to_edge. The Edge has the command locally in
+// 'received' state at this point but has not yet dispatched it to the agent —
+// the F4b poll response carries cancelled_correlation_ids so the Edge drops
+// these commands in its poll handler (persist→cancel-check→dispatch) before
+// they ever reach an endpoint. Once delivered_to_endpoint, the command is on
+// its way to running and cancel returns ErrNotCancellable (the authoritative
+// terminal result will land on the row).
 //
 // succeeded/failed/expired/cancelled are terminal sinks (no transitions out).
 //
@@ -193,34 +202,37 @@ func MarkTerminal(ctx context.Context, tx *sql.Tx, correlationID, edgeID, status
 		status, message, now)
 }
 
-// MarkCancelled: queued AND not-yet-poll-delivered → cancelled only.
+// MarkCancelled: queued | delivered_to_edge → cancelled (Decision 6 full window).
 // actorUserID is the operator. Returns ErrNotCancellable once the command has
-// been handed to an Edge (poll_delivered_at set) or is delivered_to_edge or
-// later, ErrNotFound if it doesn't exist.
+// reached delivered_to_endpoint or beyond, ErrNotFound if it doesn't exist.
 //
-// The poll_delivered_at IS NULL guard closes the cancel-vs-poll race (codex
-// round 3 #1): poll returns queued commands without changing state, so a bare
-// state='queued' check could cancel a command the Edge already received in a
-// poll response (and will run) — its later result would then be lost on a
-// terminal cancelled row. poll_delivered_at is set atomically when poll hands
-// the command out, so cancellation only succeeds for commands no Edge has seen.
+// F4b cancel-signal mechanism: F4a narrowed this to queued-only with a
+// poll_delivered_at IS NULL guard because there was no way to tell the Edge to
+// drop a command it had already received via poll. F4b restores Decision 6's
+// full window by adding cancelled_correlation_ids to the poll response and
+// having the Edge honor cancel-before-dispatch in its poll handler
+// (persist→cancel-check→dispatch). With that signal in place:
 //
-// F4a scope (codex round 1 #4): cancellation is restricted to `queued` — a
-// command the Edge has not yet acked. Decision 6's wider window (cancel before
-// delivered_to_endpoint, i.e. including delivered_to_edge) is unsafe in F4a
-// because there is no Vantage→Edge cancel signal: once the Edge acks
-// (delivered_to_edge) it has persisted the command locally and will dispatch
-// it, so marking it cancelled at Vantage while the Edge still runs it produces
-// divergent state (and the authoritative result would then land on a
-// "cancelled" row). Widening to delivered_to_edge needs F4b to deliver
-// cancellations (e.g. via poll) and drop them before dispatch — deferred.
+//   - state='queued' (poll_delivered_at NULL OR set): cancel succeeds. If the
+//     Edge has already received this command in a poll response but not yet
+//     acked, it will see this command in cancelled_correlation_ids on its next
+//     poll and drop it before dispatch (Decision 6).
+//   - state='delivered_to_edge': cancel succeeds. The Edge has the command
+//     locally in 'received' state but hasn't dispatched to the endpoint —
+//     same signal-delivery story.
+//   - state='delivered_to_endpoint' or later: cancel returns ErrNotCancellable
+//     (Decision 6 — can't cancel post-dispatch; the command runs to completion
+//     and its authoritative terminal result lands on the row).
+//
+// The previous poll_delivered_at IS NULL guard is removed because the cancel
+// signal now handles that race directly on the Edge.
 func MarkCancelled(ctx context.Context, tx *sql.Tx, correlationID, actorUserID string) error {
 	now := time.Now().Unix()
 	res, err := tx.ExecContext(ctx, `
 		UPDATE command_queue
 		SET state = 'cancelled', result_status = 'cancelled',
 			result_message = 'cancelled by operator', terminal_at = $2
-		WHERE correlation_id = $1 AND state = 'queued' AND poll_delivered_at IS NULL`,
+		WHERE correlation_id = $1 AND state IN ('queued', 'delivered_to_edge')`,
 		correlationID, now)
 	if err != nil {
 		return fmt.Errorf("commands: cancel: %w", err)

@@ -233,14 +233,25 @@ func postEdgeEvents(c *fiber.Ctx) error {
 				Status  string `json:"status"`
 				Message string `json:"message"`
 			}
-			if jerr := json.Unmarshal(e.Payload, &p); jerr != nil || (p.Status != commands.StateSucceeded && p.Status != commands.StateFailed) {
+			if jerr := json.Unmarshal(e.Payload, &p); jerr != nil || (p.Status != commands.StateSucceeded && p.Status != commands.StateFailed && p.Status != commands.StateCancelled) {
 				rejected = append(rejected, rejection{
 					CorrelationID: e.CorrelationID,
-					Reason:        "command.result payload must carry status succeeded|failed",
+					Reason:        "command.result payload must carry status succeeded|failed|cancelled",
 				})
 				continue
 			}
-			if hardErr := tolerateBenign(commands.MarkTerminal(ctx, tx, e.CorrelationID, edgeID, p.Status, p.Message)); hardErr != nil {
+			if p.Status == commands.StateCancelled {
+				// F4b cancel-signal confirmation: the Edge dropped the command in
+				// response to a cancelled_correlation_ids signal. Vantage's row is
+				// already state='cancelled' (operator initiated; that's what
+				// generated the signal in the first place), so no MarkTerminal
+				// call — state is already correct. Record an audit entry inside
+				// the tx so the confirmation lands atomically with the rest of
+				// the batch and is cross-attested via the chain head.
+				if aerr := events.AuditLogSyncTx(tx, edgeID, "command.cancellation_confirmed", "command", e.CorrelationID, p.Message, ""); aerr != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "audit write failed"})
+				}
+			} else if hardErr := tolerateBenign(commands.MarkTerminal(ctx, tx, e.CorrelationID, edgeID, p.Status, p.Message)); hardErr != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "command transition failed"})
 			}
 		default:
@@ -487,6 +498,17 @@ func pollEdge(c *fiber.Ctx) error {
 		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
 		pendingCommands = []pollCommandDTO{}
 	}
+	// Cancellation signal (F4b restores Decision 6 full window). Includes any
+	// command for this Edge that the operator cancelled but that has not yet
+	// reached delivered_to_endpoint. The Edge consults this list between
+	// persist and dispatch to drop commands that were cancelled while at Edge
+	// (or in transit). Degrade to empty on read failure for the same reason as
+	// above — the poll's token-rotation work must not be lost.
+	cancelledIDs, ccerr := fetchCancelledCorrelationIDs(edgeID)
+	if ccerr != nil {
+		slog.Error("poll: fetch cancelled correlation_ids", "error", ccerr, "edge_id", edgeID)
+		cancelledIDs = []string{}
+	}
 	resp := fiber.Map{
 		"vantage_version": "0.1.0",
 		"audit_chain_head": fiber.Map{
@@ -494,6 +516,7 @@ func pollEdge(c *fiber.Ctx) error {
 			"signature": vantageSig,
 		},
 		"commands":                  pendingCommands,
+		"cancelled_correlation_ids": cancelledIDs,
 		"next_poll_after_seconds":   defaultPollIntervalSeconds,
 		"min_required_edge_version": minimum,
 	}

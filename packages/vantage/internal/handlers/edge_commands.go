@@ -106,6 +106,45 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 	return out, rows.Err()
 }
 
+// fetchCancelledCorrelationIDs returns correlation_ids of commands the operator
+// cancelled while they were still pre-dispatch (state='cancelled' and never
+// reached delivered_to_endpoint). F4b includes these in the poll response so
+// the Edge can drop them between persist and dispatch (Decision 6 cancel
+// window restoration; see commands.MarkCancelled).
+//
+// delivered_to_endpoint_at IS NULL is belt-and-suspenders: MarkCancelled's
+// state predicate (queued|delivered_to_edge) already implies no
+// delivered_to_endpoint transition fired, but the explicit NULL guard keeps
+// the cancel signal honest even if a future state-machine change widens the
+// cancel predicate.
+//
+// No time bound: an unacked cancellation will re-appear in every poll until
+// the row is reaped. The Edge no-ops on unknown correlation_ids, so the only
+// cost is wire bandwidth (a UUID per cancelled-but-unreaped row). The TTL
+// sweeper and an eventual command-retention sweep will bound this set in
+// practice; if it becomes hot, a `terminal_at > now - retention` filter is a
+// drop-in refinement.
+func fetchCancelledCorrelationIDs(edgeID string) ([]string, error) {
+	rows, err := db.DB.Query(`
+		SELECT correlation_id FROM command_queue
+		WHERE edge_id = $1
+		  AND state = 'cancelled'
+		  AND delivered_to_endpoint_at IS NULL`, edgeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var cid string
+		if err := rows.Scan(&cid); err != nil {
+			return nil, err
+		}
+		out = append(out, cid)
+	}
+	return out, rows.Err()
+}
+
 func postEdgeCommandsAck(c *fiber.Ctx) error {
 	var req struct {
 		AckedCorrelationIDs []string `json:"acked_correlation_ids"`

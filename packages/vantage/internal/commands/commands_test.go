@@ -158,7 +158,10 @@ func TestCommandLifecycle_AllTransitions(t *testing.T) {
 		},
 		{
 			name: "MarkCancelled", toState: StateCancelled,
-			legalFrom: map[string]bool{StateQueued: true}, missErr: ErrNotCancellable,
+			// F4b restores Decision 6's full window: cancel is legal from queued
+			// AND delivered_to_edge (the F4a-narrowed queued-only set is gone,
+			// the cancel signal in the poll response handles the race).
+			legalFrom: map[string]bool{StateQueued: true, StateDeliveredToEdge: true}, missErr: ErrNotCancellable,
 			apply: func(tx *sql.Tx, cid string) error { return MarkCancelled(ctx, tx, cid, "op1") },
 		},
 	}
@@ -225,10 +228,14 @@ func TestMarkDeliveredToEdge_NotFound(t *testing.T) {
 	}
 }
 
-// TestMarkCancelled_RefusesPollDelivered: once a command has been handed out
-// in a poll (poll_delivered_at set), cancellation is refused even while the
-// row is still 'queued' (codex round 3 #1) — the Edge may already run it.
-func TestMarkCancelled_RefusesPollDelivered(t *testing.T) {
+// TestMarkCancelled_PostPollDelivery_Succeeds_F4b: F4b restores Decision 6's
+// full cancel window. The F4a poll_delivered_at IS NULL guard is gone; the
+// Edge now learns about cancellations via cancelled_correlation_ids in the
+// poll response and drops the command between persist and dispatch. So
+// cancellation succeeds even after the command has been handed out in a poll
+// (state still 'queued', poll_delivered_at set) — the Edge's next poll picks
+// up the cancel signal.
+func TestMarkCancelled_PostPollDelivery_Succeeds_F4b(t *testing.T) {
 	setupCommandsTest(t)
 	ctx := context.Background()
 	cid := enqueueOne(t)
@@ -236,9 +243,53 @@ func TestMarkCancelled_RefusesPollDelivered(t *testing.T) {
 		t.Fatalf("mark poll-delivered: %v", err)
 	}
 	tx, _ := db.DB.BeginTx(ctx, nil)
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel of poll-delivered command: want nil (F4b cancel signal handles the race), got %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := currentState(t, cid); got != StateCancelled {
+		t.Errorf("state after cancel=%s, want cancelled", got)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEdge_Succeeds_F4b: cancel is legal from
+// delivered_to_edge under F4b (Decision 6 full window). The Edge has the
+// command locally in its 'received' state, the cancel signal in the next poll
+// response tells it to drop the command before dispatch.
+func TestMarkCancelled_DeliveredToEdge_Succeeds_F4b(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	forceState(t, cid, StateDeliveredToEdge)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); err != nil {
+		t.Fatalf("cancel of delivered_to_edge command: want nil (F4b restored window), got %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := currentState(t, cid); got != StateCancelled {
+		t.Errorf("state after cancel=%s, want cancelled", got)
+	}
+}
+
+// TestMarkCancelled_DeliveredToEndpoint_Refuses: post-dispatch is still off
+// limits (Decision 6 — command runs to completion, terminal result is
+// authoritative). The state-table forcing test also covers this; this case is
+// called out explicitly because it is the cutoff edge F4b deliberately keeps.
+func TestMarkCancelled_DeliveredToEndpoint_Refuses(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	forceState(t, cid, StateDeliveredToEndpoint)
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer func() { _ = tx.Rollback() }()
 	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
-		t.Fatalf("cancel of poll-delivered command: want ErrNotCancellable, got %v", err)
+		t.Fatalf("cancel of delivered_to_endpoint: want ErrNotCancellable, got %v", err)
 	}
 }
 

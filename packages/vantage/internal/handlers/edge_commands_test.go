@@ -248,6 +248,170 @@ func TestCommandsAck_TransitionsAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestPoll_IncludesCancelledCorrelationIDs: F4b cancel-signal restoration.
+// Cancelled commands that have not reached delivered_to_endpoint must appear
+// in the poll response so the Edge can drop them before dispatch.
+func TestPoll_IncludesCancelledCorrelationIDs(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	future := now + 3600
+	// One cancelled-from-queued (Edge may have it via prior poll), one
+	// cancelled-from-delivered_to_edge (Edge acked it locally), one live
+	// queued (should arrive in commands, NOT cancelled list), one
+	// delivered_to_endpoint-then-cancelled (must NOT appear — past the
+	// Decision 6 cutoff; in practice MarkCancelled would never have
+	// transitioned this, but we force-state it to verify the
+	// delivered_to_endpoint_at IS NULL guard in the fetch query).
+	seedQueuedCommand(t, "cid-cancel-from-queued", "tenant-x", "edge-1", "host-a", future)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-cancel-from-queued'`, now)
+
+	seedQueuedCommand(t, "cid-cancel-from-dte", "tenant-x", "edge-1", "host-b", future)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-cancel-from-dte'`, now)
+
+	seedQueuedCommand(t, "cid-live", "tenant-x", "edge-1", "host-c", future)
+
+	seedQueuedCommand(t, "cid-cancelled-but-dispatched", "tenant-x", "edge-1", "host-d", future)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1, delivered_to_endpoint_at=$1 WHERE correlation_id='cid-cancelled-but-dispatched'`, now)
+
+	resp := postEdgePoll(t, app, tok, pollBody())
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("poll status=%d", resp.StatusCode)
+	}
+	var out struct {
+		Commands []struct {
+			CorrelationID string `json:"correlation_id"`
+		} `json:"commands"`
+		CancelledCorrelationIDs []string `json:"cancelled_correlation_ids"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+
+	got := map[string]bool{}
+	for _, c := range out.CancelledCorrelationIDs {
+		got[c] = true
+	}
+	if !got["cid-cancel-from-queued"] {
+		t.Error("missing cancelled-from-queued in cancelled_correlation_ids")
+	}
+	if !got["cid-cancel-from-dte"] {
+		t.Error("missing cancelled-from-delivered_to_edge in cancelled_correlation_ids")
+	}
+	if got["cid-cancelled-but-dispatched"] {
+		t.Error("included cancelled-but-delivered_to_endpoint in cancelled_correlation_ids (delivered_to_endpoint_at IS NULL guard failed)")
+	}
+	// Live queued command must arrive in commands, not in cancelled.
+	if got["cid-live"] {
+		t.Error("live queued command appeared in cancelled_correlation_ids")
+	}
+	live := false
+	for _, c := range out.Commands {
+		if c.CorrelationID == "cid-live" {
+			live = true
+		}
+	}
+	if !live {
+		t.Error("live queued command not delivered in commands list")
+	}
+}
+
+// TestPoll_CancelledCorrelationIDs_EdgeScoped: the cancel-signal list must
+// not leak cancellations from a different Edge.
+func TestPoll_CancelledCorrelationIDs_EdgeScoped(t *testing.T) {
+	app := edgeFederationEnv(t)
+	_ = seedEdgeForPoll(t, "edge-A", "tenant-x", time.Hour)
+	tokB := seedEdgeForPoll(t, "edge-B", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	seedQueuedCommand(t, "cid-A-cancelled", "tenant-x", "edge-A", "host-a", now+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-A-cancelled'`, now)
+
+	resp := postEdgePoll(t, app, tokB, pollBody())
+	defer resp.Body.Close()
+	var out struct {
+		CancelledCorrelationIDs []string `json:"cancelled_correlation_ids"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	for _, c := range out.CancelledCorrelationIDs {
+		if c == "cid-A-cancelled" {
+			t.Error("edge-B poll leaked edge-A's cancellation")
+		}
+	}
+}
+
+// TestEdgeEvents_CommandResultCancelled_Accepted: F4b accepts
+// command.result(status=cancelled) as informational confirmation from the
+// Edge. Vantage's row is already cancelled (operator initiated), so the
+// handler records an audit entry without re-transitioning state.
+func TestEdgeEvents_CommandResultCancelled_Accepted(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	seedQueuedCommand(t, "cid-conf", "tenant-x", "edge-1", "host-a", now+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-conf'`, now)
+
+	resp := postEdgeEventsHTTP(t, app, tok, map[string]any{
+		"events": []map[string]any{
+			{
+				"correlation_id": "cid-conf",
+				"type":           "command.result",
+				"occurred_at":    now,
+				"payload":        map[string]string{"status": "cancelled", "message": "dropped per cancel-signal"},
+			},
+		},
+		"audit_chain_head": map[string]any{"seq": 1, "signature": "sig"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out struct {
+		Accepted int             `json:"accepted"`
+		Rejected []map[string]any `json:"rejected"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Accepted != 1 || len(out.Rejected) != 0 {
+		t.Fatalf("accepted=%d rejected=%+v, want 1/[]", out.Accepted, out.Rejected)
+	}
+	if s := cmdState(t, "cid-conf"); s != "cancelled" {
+		t.Errorf("state after cancel-confirmation event=%s, want cancelled (state should not transition)", s)
+	}
+	var auditN int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='command.cancellation_confirmed' AND resource_id='cid-conf'`).Scan(&auditN)
+	if auditN != 1 {
+		t.Errorf("command.cancellation_confirmed audit entries=%d, want 1", auditN)
+	}
+}
+
+// TestEdgeEvents_CommandResultBadStatus_Rejected: any status other than
+// succeeded|failed|cancelled is rejected at parse stage.
+func TestEdgeEvents_CommandResultBadStatus_Rejected(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	seedQueuedCommand(t, "cid-bad", "tenant-x", "edge-1", "host-a", now+3600)
+
+	resp := postEdgeEventsHTTP(t, app, tok, map[string]any{
+		"events": []map[string]any{
+			{
+				"correlation_id": "cid-bad",
+				"type":           "command.result",
+				"occurred_at":    now,
+				"payload":        map[string]string{"status": "weirdo", "message": "x"},
+			},
+		},
+		"audit_chain_head": map[string]any{"seq": 1, "signature": "sig"},
+	})
+	defer resp.Body.Close()
+	var out struct {
+		Accepted int                       `json:"accepted"`
+		Rejected []map[string]any          `json:"rejected"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if out.Accepted != 0 || len(out.Rejected) != 1 {
+		t.Errorf("bad status: accepted=%d rejected=%d, want 0/1", out.Accepted, len(out.Rejected))
+	}
+}
+
 func TestCommandsAck_EdgeScoped(t *testing.T) {
 	app := edgeFederationEnv(t)
 	_ = seedEdgeForPoll(t, "edge-A", "tenant-x", time.Hour)
