@@ -313,6 +313,15 @@ func TestCancel_Unknown_404(t *testing.T) {
 // TestListCommands_StablePagination: commands sharing a queued_at second (a
 // tag/multi-endpoint fan-out) must page without dup/skip thanks to the id
 // tie-breaker (codex round 5 #1).
+func TestListCommands_RequiresSuperAdmin_403(t *testing.T) {
+	app := commandAPIEnv(t, "admin") // authenticated, but not super_admin
+	resp := doCmd(t, app, http.MethodGet, "/api/v1/commands", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != 403 {
+		t.Errorf("list commands as admin: status=%d, want 403", resp.StatusCode)
+	}
+}
+
 func TestListCommands_StablePagination(t *testing.T) {
 	app := commandAPIEnv(t, "super_admin")
 	seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)

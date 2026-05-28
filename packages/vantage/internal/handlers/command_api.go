@@ -235,6 +235,13 @@ type CommandRow struct {
 }
 
 func listCommandsHandler(c *fiber.Ctx) error {
+	// Same gate as enqueue/cancel: the command surface (endpoint IDs, result
+	// messages) is super_admin-only. Without this an authenticated 'admin'
+	// could enumerate all command history (codex round 6).
+	role, _ := c.Locals("user_role").(string)
+	if !auth.IsSuperAdmin(role) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "super_admin required"})
+	}
 	limit, offset := parsePagination(c)
 
 	// Optional filters: edge_id, state, tenant_id. Build the WHERE clause
