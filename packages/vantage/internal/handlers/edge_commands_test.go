@@ -196,6 +196,26 @@ func TestPoll_QueuedOrderedBeforeRedeliveries(t *testing.T) {
 	}
 }
 
+// TestPoll_MarksPollDelivered: poll stamps poll_delivered_at on a delivered
+// command (atomically with handing it out) WITHOUT changing its state, so
+// cancellation can tell the command was handed to an Edge (codex round 3 #1).
+func TestPoll_MarksPollDelivered(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	seedQueuedCommand(t, "cid-m", "tenant-x", "edge-1", "host-a", time.Now().Unix()+3600)
+
+	postEdgePoll(t, app, tok, pollBody()).Body.Close()
+
+	var marked int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM command_queue WHERE correlation_id='cid-m' AND poll_delivered_at IS NOT NULL`).Scan(&marked)
+	if marked != 1 {
+		t.Error("poll did not stamp poll_delivered_at")
+	}
+	if s := cmdState(t, "cid-m"); s != "queued" {
+		t.Errorf("poll changed state to %s, want queued (poll marks delivery, not state)", s)
+	}
+}
+
 func TestCommandsAck_TransitionsAndIsIdempotent(t *testing.T) {
 	app := edgeFederationEnv(t)
 	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)

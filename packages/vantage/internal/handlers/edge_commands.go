@@ -3,8 +3,10 @@ package handlers
 // F4a: the Edge side of the command pipeline (Decision 2 — poll delivers,
 // a dedicated ack transitions state).
 //
-//   - fetchPendingCommands: read the commands to hand an Edge in its poll
-//     response. Poll does NOT mutate command state.
+//   - fetchPendingCommands: select the commands to hand an Edge in its poll
+//     response. Poll does NOT change command STATE (the queued->delivered_to_
+//     edge transition is the ack's job); it only stamps the poll_delivered_at
+//     delivery marker atomically with the select.
 //   - POST /api/edge/commands/ack: the Edge persisted the commands locally
 //     and now acks; we transition queued -> delivered_to_edge. Idempotent and
 //     edge-scoped.
@@ -51,26 +53,44 @@ type pollCommandDTO struct {
 // idempotency; the Edge dedupes on correlation_id). State does NOT change on
 // poll; the queued->delivered_to_edge transition happens on ACK (Decision 2).
 //
-// The TTL filter applies ONLY to queued rows, and with an ackGraceSeconds
-// margin (codex round 2 #1): a queued command is delivered only if it has more
-// than ackGraceSeconds of TTL left, guaranteeing time to ack before the sweep
-// (expires_at <= now) could expire it. delivered_to_edge rows are ALWAYS
-// re-pollable regardless of expires_at — the queued TTL no longer applies once
-// the Edge acked, and re-delivery lets an Edge that lost its local copy (crash
-// before dispatch) recover the command rather than strand it (codex round 1 #3).
+// It is a single atomic UPDATE ... RETURNING (codex round 3 #1): the rows it
+// hands out get poll_delivered_at stamped in the SAME statement, so there is
+// no window where a command is delivered but unmarked — MarkCancelled's
+// poll_delivered_at IS NULL guard then can't race a concurrent poll. nowUnix
+// MUST be a fresh time.Now() captured by the caller right before this call
+// (codex round 3 #4) — a stale value could let an already-near-expiry command
+// slip past the grace filter.
 //
-// Ordering puts queued commands FIRST (codex round 2 #5): with the LIMIT, a
-// backlog of stuck delivered_to_edge redeliveries must not crowd out newly
-// queued commands — new operator intent always flows; redeliveries (recovery
-// insurance for an Edge that already has the command) fill the spare slots.
+// The inner CTE selects the rows with FOR UPDATE SKIP LOCKED (so concurrent
+// multi-node polls don't double-hand-out the same row) applying:
+//   - the TTL grace margin to queued rows ONLY (codex round 2 #1): a queued
+//     command is delivered only with > ackGraceSeconds of TTL left, so it can
+//     be acked before the sweep (expires_at <= now) could expire it;
+//   - always re-polling delivered_to_edge rows regardless of expires_at (codex
+//     round 1 #3), so an Edge that lost its local copy recovers the command;
+//   - queued-first ordering under the LIMIT (codex round 2 #5), so a backlog
+//     of stuck redeliveries can't starve newly queued commands.
+//
+// COALESCE keeps the FIRST poll_delivered_at (the marker means "first handed
+// out"); the RETURNING order is unspecified but irrelevant (the Edge
+// processes every command).
 func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error) {
 	rows, err := db.DB.Query(`
-		SELECT correlation_id, target_endpoint_id, command_type, command_params
-		FROM command_queue
-		WHERE edge_id = $1
-		  AND ( (state = 'queued' AND expires_at > $2) OR state = 'delivered_to_edge' )
-		ORDER BY (state <> 'queued'), queued_at ASC
-		LIMIT 50`, edgeID, nowUnix+ackGraceSeconds)
+		WITH picked AS (
+			SELECT correlation_id
+			FROM command_queue
+			WHERE edge_id = $1
+			  AND ( (state = 'queued' AND expires_at > $3) OR state = 'delivered_to_edge' )
+			ORDER BY (state <> 'queued'), queued_at ASC
+			LIMIT 50
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE command_queue c
+		SET poll_delivered_at = COALESCE(c.poll_delivered_at, $2)
+		FROM picked
+		WHERE c.correlation_id = picked.correlation_id
+		RETURNING c.correlation_id, c.target_endpoint_id, c.command_type, c.command_params`,
+		edgeID, nowUnix, nowUnix+ackGraceSeconds)
 	if err != nil {
 		return nil, err
 	}

@@ -141,20 +141,30 @@ func MarkDeliveredToEdge(ctx context.Context, tx *sql.Tx, correlationID, edgeID 
 		SystemActor, "command.delivered_to_edge", "", time.Now().Unix())
 }
 
-// MarkDeliveredToEndpoint: delivered_to_edge → delivered_to_endpoint, when the
-// Edge reports the agent received the command (via /api/edge/events).
+// Progress transitions are MONOTONIC (codex round 3 #2): each is legal from
+// any earlier live state, not just its immediate predecessor. Edge progress
+// events (delivered_to_endpoint, executing) can arrive out of order or beat
+// the ack across retried event batches; if they were legal only from the
+// immediate predecessor, an early event would hit ErrInvalidTransition, be
+// tolerated as benign, and the progress would be lost (leaving the command
+// parked). Allowing them from any lower live state means a progress event
+// always advances the command to its level (and is a benign no-op from an
+// equal/higher state).
+
+// MarkDeliveredToEndpoint: queued|delivered_to_edge → delivered_to_endpoint,
+// when the Edge reports the agent received the command (via /api/edge/events).
 func MarkDeliveredToEndpoint(ctx context.Context, tx *sql.Tx, correlationID, edgeID string) error {
 	return casTransition(ctx, tx, correlationID, edgeID,
 		"state = 'delivered_to_endpoint', delivered_to_endpoint_at = $2",
-		[]string{StateDeliveredToEdge},
+		[]string{StateQueued, StateDeliveredToEdge},
 		SystemActor, "command.delivered_to_endpoint", "", time.Now().Unix())
 }
 
-// MarkExecuting: delivered_to_endpoint → executing.
+// MarkExecuting: queued|delivered_to_edge|delivered_to_endpoint → executing.
 func MarkExecuting(ctx context.Context, tx *sql.Tx, correlationID, edgeID string) error {
 	return casTransition(ctx, tx, correlationID, edgeID,
 		"state = 'executing'",
-		[]string{StateDeliveredToEndpoint},
+		[]string{StateQueued, StateDeliveredToEdge, StateDeliveredToEndpoint},
 		SystemActor, "command.executing", "")
 }
 
@@ -183,9 +193,17 @@ func MarkTerminal(ctx context.Context, tx *sql.Tx, correlationID, edgeID, status
 		status, message, now)
 }
 
-// MarkCancelled: queued → cancelled only. actorUserID is the operator.
-// Returns ErrNotCancellable once the command is delivered_to_edge or later,
-// ErrNotFound if it doesn't exist.
+// MarkCancelled: queued AND not-yet-poll-delivered → cancelled only.
+// actorUserID is the operator. Returns ErrNotCancellable once the command has
+// been handed to an Edge (poll_delivered_at set) or is delivered_to_edge or
+// later, ErrNotFound if it doesn't exist.
+//
+// The poll_delivered_at IS NULL guard closes the cancel-vs-poll race (codex
+// round 3 #1): poll returns queued commands without changing state, so a bare
+// state='queued' check could cancel a command the Edge already received in a
+// poll response (and will run) — its later result would then be lost on a
+// terminal cancelled row. poll_delivered_at is set atomically when poll hands
+// the command out, so cancellation only succeeds for commands no Edge has seen.
 //
 // F4a scope (codex round 1 #4): cancellation is restricted to `queued` — a
 // command the Edge has not yet acked. Decision 6's wider window (cancel before
@@ -202,7 +220,7 @@ func MarkCancelled(ctx context.Context, tx *sql.Tx, correlationID, actorUserID s
 		UPDATE command_queue
 		SET state = 'cancelled', result_status = 'cancelled',
 			result_message = 'cancelled by operator', terminal_at = $2
-		WHERE correlation_id = $1 AND state = 'queued'`,
+		WHERE correlation_id = $1 AND state = 'queued' AND poll_delivered_at IS NULL`,
 		correlationID, now)
 	if err != nil {
 		return fmt.Errorf("commands: cancel: %w", err)

@@ -208,6 +208,17 @@ func postEdgeEvents(c *fiber.Ctx) error {
 			})
 			continue
 		}
+		// A command.* event with no correlation_id can't be matched to a row;
+		// the transition would return ErrNotFound, which tolerateBenign would
+		// mask as accepted, telling the Edge not to retry a result that never
+		// landed. Reject so the Edge resends with the id (codex round 3 #3).
+		if strings.HasPrefix(e.Type, "command.") && e.CorrelationID == "" {
+			rejected = append(rejected, rejection{
+				CorrelationID: e.CorrelationID,
+				Reason:        "command event missing correlation_id",
+			})
+			continue
+		}
 		switch e.Type {
 		case "command.delivered_to_endpoint":
 			if hardErr := tolerateBenign(commands.MarkDeliveredToEndpoint(ctx, tx, e.CorrelationID, edgeID)); hardErr != nil {
@@ -468,7 +479,10 @@ func pollEdge(c *fiber.Ctx) error {
 	// correct and avoids holding the edges-row lock across the scan. A read
 	// error here must NOT fail the poll — the token rotation is already
 	// durable; degrade to an empty command set and the Edge retries next poll.
-	pendingCommands, cerr := fetchPendingCommands(edgeID, nowUnix)
+	// Fresh timestamp (NOT the pre-lock nowUnix): if the poll blocked on the
+	// edges FOR UPDATE lock or commit, a stale value could let a near-expiry
+	// command slip past the grace filter (codex round 3 #4).
+	pendingCommands, cerr := fetchPendingCommands(edgeID, time.Now().Unix())
 	if cerr != nil {
 		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
 		pendingCommands = []pollCommandDTO{}

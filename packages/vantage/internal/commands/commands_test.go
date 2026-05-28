@@ -138,12 +138,12 @@ func TestCommandLifecycle_AllTransitions(t *testing.T) {
 		},
 		{
 			name: "MarkDeliveredToEndpoint", toState: StateDeliveredToEndpoint,
-			legalFrom: map[string]bool{StateDeliveredToEdge: true}, missErr: ErrInvalidTransition,
+			legalFrom: map[string]bool{StateQueued: true, StateDeliveredToEdge: true}, missErr: ErrInvalidTransition,
 			apply: func(tx *sql.Tx, cid string) error { return MarkDeliveredToEndpoint(ctx, tx, cid, "edge1") },
 		},
 		{
 			name: "MarkExecuting", toState: StateExecuting,
-			legalFrom: map[string]bool{StateDeliveredToEndpoint: true}, missErr: ErrInvalidTransition,
+			legalFrom: map[string]bool{StateQueued: true, StateDeliveredToEdge: true, StateDeliveredToEndpoint: true}, missErr: ErrInvalidTransition,
 			apply: func(tx *sql.Tx, cid string) error { return MarkExecuting(ctx, tx, cid, "edge1") },
 		},
 		{
@@ -222,6 +222,23 @@ func TestMarkDeliveredToEdge_NotFound(t *testing.T) {
 	defer tx.Rollback()
 	if err := MarkDeliveredToEdge(ctx, tx, "no-such-correlation", "edge1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// TestMarkCancelled_RefusesPollDelivered: once a command has been handed out
+// in a poll (poll_delivered_at set), cancellation is refused even while the
+// row is still 'queued' (codex round 3 #1) — the Edge may already run it.
+func TestMarkCancelled_RefusesPollDelivered(t *testing.T) {
+	setupCommandsTest(t)
+	ctx := context.Background()
+	cid := enqueueOne(t)
+	if _, err := db.DB.Exec(`UPDATE command_queue SET poll_delivered_at = $1 WHERE correlation_id = $2`, time.Now().Unix(), cid); err != nil {
+		t.Fatalf("mark poll-delivered: %v", err)
+	}
+	tx, _ := db.DB.BeginTx(ctx, nil)
+	defer tx.Rollback()
+	if err := MarkCancelled(ctx, tx, cid, "op1"); !errors.Is(err, ErrNotCancellable) {
+		t.Fatalf("cancel of poll-delivered command: want ErrNotCancellable, got %v", err)
 	}
 }
 

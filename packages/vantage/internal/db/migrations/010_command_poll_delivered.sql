@@ -1,0 +1,14 @@
+-- F4a (codex round 3 #1): a delivery marker that closes the cancel-vs-poll
+-- race. Poll deliberately returns queued commands WITHOUT changing their state
+-- (Decision 2 — the queued->delivered_to_edge state transition is the Edge's
+-- ack), so `state = 'queued'` does NOT prove the Edge has not already received
+-- the command in a poll response. An operator cancel in the window after poll
+-- hands a command out but before the ack would mark it cancelled while the
+-- Edge still holds (and may dispatch) it, and the later result would be lost.
+--
+-- poll_delivered_at records (once) when a command was first handed out in a
+-- poll response. Poll sets it atomically while selecting the rows (UPDATE ...
+-- RETURNING); MarkCancelled refuses any command whose marker is set. This
+-- keeps Decision 2 intact (poll changes no STATE) while making "has this been
+-- delivered to an Edge yet?" answerable.
+ALTER TABLE command_queue ADD COLUMN poll_delivered_at BIGINT;
