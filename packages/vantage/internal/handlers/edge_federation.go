@@ -503,11 +503,33 @@ func pollEdge(c *fiber.Ctx) error {
 	}
 
 	// 3c. Refresh reported edge_version and cancel-signal capability. Inside
-	// the tx so a failure rolls back any rotation just performed. The
-	// capability flag is set on every poll (not OR'd) so a downgrade from F4b
-	// back to F4a-or-earlier cleanly drops the flag.
-	if _, err := tx.Exec(
-		`UPDATE edges SET edge_version = $1, supports_cancel_signal = $2 WHERE id = $3`,
+	// the tx so a failure rolls back any rotation just performed.
+	//
+	// Capability downgrade guard (codex review of PR #3 round 5 #2): if the
+	// edge currently advertises supports_cancel_signal=true AND has
+	// unconfirmed cancellations sitting in command_queue, refuse the
+	// downgrade — keep the flag true. A downgraded Edge would not understand
+	// cancelled_correlation_ids and could dispatch a locally-persisted
+	// command that Vantage already terminal-cancelled. The CASE preserves
+	// the flag in that exact window; once the Edge confirms all outstanding
+	// cancellations, a subsequent poll with supports_cancel_signal=false
+	// drops the flag cleanly.
+	if _, err := tx.Exec(`
+		UPDATE edges
+		SET edge_version = $1,
+		    supports_cancel_signal = CASE
+		        WHEN supports_cancel_signal = true
+		         AND $2 = false
+		         AND EXISTS (
+		             SELECT 1 FROM command_queue
+		             WHERE edge_id = edges.id
+		               AND state = 'cancelled'
+		               AND delivered_to_endpoint_at IS NULL
+		               AND cancellation_confirmed_at IS NULL
+		         ) THEN true
+		        ELSE $2
+		    END
+		WHERE id = $3`,
 		req.EdgeVersion, req.SupportsCancelSignal, edgeID,
 	); err != nil {
 		slog.Error("poll: edge_version/capability update", "error", err, "edge_id", edgeID)
@@ -576,8 +598,8 @@ func pollEdge(c *fiber.Ctx) error {
 		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
 		pendingCommands = []pollCommandDTO{}
 	}
-	cancelledIDs, ccerr := fetchCancelledCorrelationIDs(edgeID)
-	cancelSignalComplete := ccerr == nil
+	cancelledIDs, cancelTruncated, ccerr := fetchCancelledCorrelationIDs(edgeID)
+	cancelSignalComplete := ccerr == nil && !cancelTruncated
 	if ccerr != nil {
 		slog.Error("poll: fetch cancelled correlation_ids", "error", ccerr, "edge_id", edgeID)
 		cancelledIDs = []string{}
@@ -587,6 +609,17 @@ func pollEdge(c *fiber.Ctx) error {
 		// Stamped poll_delivered_at markers persist but the row is reachable
 		// again on the next poll's atomic SELECT (the WHERE matches
 		// state=queued regardless of marker).
+		pendingCommands = []pollCommandDTO{}
+	} else if cancelTruncated {
+		// Truncated batch (more than maxCancelSignalBatch unconfirmed): the
+		// remaining cancellations did not ship in this response, so the Edge
+		// MUST NOT dispatch any locally-persisted commands this cycle — one
+		// of them may be operator-cancelled but its correlation_id sits in
+		// the omitted tail (codex round 5 #1). Surface via
+		// cancel_signal_complete=false and zero the commands list. The Edge
+		// will see cancellations next cycle as it confirms the current batch
+		// and the backlog drains.
+		slog.Info("poll: cancel signal batch truncated", "edge_id", edgeID, "delivered", len(cancelledIDs), "limit", maxCancelSignalBatch)
 		pendingCommands = []pollCommandDTO{}
 	}
 	resp := fiber.Map{

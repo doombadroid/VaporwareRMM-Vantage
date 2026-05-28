@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -469,6 +470,101 @@ func TestPoll_CancelSignal_DropsAfterConfirmation(t *testing.T) {
 	}
 	if got["cid-confirmed"] {
 		t.Error("confirmed cancellation still appears in signal (would replay forever)")
+	}
+}
+
+// TestPoll_CancelSignal_Truncated: more than maxCancelSignalBatch unconfirmed
+// cancellations triggers truncation; the response carries the first batch but
+// signals cancel_signal_complete=false so the Edge withholds dispatch (codex
+// review of PR #3 round 5 #1).
+func TestPoll_CancelSignal_Truncated(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	now := time.Now().Unix()
+	// Seed maxCancelSignalBatch+5 cancelled commands.
+	total := maxCancelSignalBatch + 5
+	for i := 0; i < total; i++ {
+		cid := fmt.Sprintf("cid-trunc-%d", i)
+		seedQueuedCommand(t, cid, "tenant-x", "edge-1", "host-a", now+3600)
+		// Spread terminal_at so ORDER BY ASC is deterministic.
+		db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id=$2`, now-int64(total-i), cid)
+	}
+
+	resp := postEdgePoll(t, app, tok, pollBody())
+	defer resp.Body.Close()
+	var out struct {
+		Commands                []json.RawMessage `json:"commands"`
+		CancelledCorrelationIDs []string          `json:"cancelled_correlation_ids"`
+		CancelSignalComplete    bool              `json:"cancel_signal_complete"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	if len(out.CancelledCorrelationIDs) != maxCancelSignalBatch {
+		t.Errorf("delivered=%d, want %d (truncation cap)", len(out.CancelledCorrelationIDs), maxCancelSignalBatch)
+	}
+	if out.CancelSignalComplete {
+		t.Error("cancel_signal_complete=true on truncated batch, want false")
+	}
+	if len(out.Commands) != 0 {
+		t.Errorf("commands not withheld on truncation: %d", len(out.Commands))
+	}
+}
+
+// TestPoll_RefusesCapabilityDowngrade: once an Edge has unconfirmed
+// cancellations queued in its cancel signal, a subsequent poll that omits
+// supports_cancel_signal (decodes to false) must NOT drop the capability
+// flag — the downgraded Edge would not understand cancelled_correlation_ids
+// and could dispatch a terminal-cancelled command (codex review of PR #3
+// round 5 #2). Once the Edge confirms the outstanding cancellations a
+// subsequent flag=false poll cleanly drops the flag.
+func TestPoll_RefusesCapabilityDowngrade(t *testing.T) {
+	app := edgeFederationEnv(t)
+	// Long-lived token so the rotation path doesn't fire mid-test (would
+	// invalidate tok between polls).
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", 25*24*time.Hour)
+	now := time.Now().Unix()
+	// Seed one unconfirmed cancellation.
+	seedQueuedCommand(t, "cid-pending", "tenant-x", "edge-1", "host-a", now+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1 WHERE correlation_id='cid-pending'`, now)
+
+	// First poll: edge advertises supports_cancel_signal=true (default in
+	// seed). This both pre-condition-sets the flag and confirms baseline.
+	resp1 := postEdgePoll(t, app, tok, map[string]any{
+		"edge_version":             "0.1.0",
+		"audit_chain_head":         map[string]any{"seq": 1, "signature": "sig"},
+		"supports_cancel_signal":   true,
+	})
+	resp1.Body.Close()
+	var flag1 bool
+	db.DB.QueryRow(`SELECT supports_cancel_signal FROM edges WHERE id='edge-1'`).Scan(&flag1)
+	if !flag1 {
+		t.Fatal("baseline supports_cancel_signal=true did not stick")
+	}
+
+	// Second poll: edge OMITS supports_cancel_signal (decodes to false).
+	// With outstanding unconfirmed cancellation, flag must STAY true.
+	resp2 := postEdgePoll(t, app, tok, map[string]any{
+		"edge_version":     "0.1.0",
+		"audit_chain_head": map[string]any{"seq": 2, "signature": "sig2"},
+	})
+	resp2.Body.Close()
+	var flag2 bool
+	db.DB.QueryRow(`SELECT supports_cancel_signal FROM edges WHERE id='edge-1'`).Scan(&flag2)
+	if !flag2 {
+		t.Error("downgrade allowed with unconfirmed cancellations (cancel signal handler missing)")
+	}
+
+	// Confirm the cancellation. Subsequent downgrade poll should now drop.
+	db.DB.Exec(`UPDATE command_queue SET cancellation_confirmed_at=$1 WHERE correlation_id='cid-pending'`, now)
+	resp3 := postEdgePoll(t, app, tok, map[string]any{
+		"edge_version":           "0.1.0",
+		"audit_chain_head":       map[string]any{"seq": 3, "signature": "sig3"},
+		"supports_cancel_signal": false,
+	})
+	resp3.Body.Close()
+	var flag3 bool
+	db.DB.QueryRow(`SELECT supports_cancel_signal FROM edges WHERE id='edge-1'`).Scan(&flag3)
+	if flag3 {
+		t.Error("downgrade refused even after cancellation was confirmed")
 	}
 }
 

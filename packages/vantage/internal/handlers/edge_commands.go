@@ -142,28 +142,41 @@ const maxCancelSignalBatch = 200
 // but the explicit NULL guard keeps the cancel signal honest even if a future
 // state-machine change widens the cancel predicate. ORDER BY terminal_at ASC
 // drains oldest cancellations first so a long backlog converges deterministically.
-func fetchCancelledCorrelationIDs(edgeID string) ([]string, error) {
-	rows, err := db.DB.Query(`
+//
+// Truncation reporting (codex review of PR #3 round 5 #1): the query fetches
+// maxCancelSignalBatch+1 rows so the caller can detect a truncated batch. The
+// returned ids are bounded to maxCancelSignalBatch; truncated=true means the
+// Edge has at least one more unconfirmed cancellation that this poll did not
+// carry. The caller MUST surface this as cancel_signal_complete=false so the
+// Edge withholds dispatch until the next poll drains more of the backlog.
+func fetchCancelledCorrelationIDs(edgeID string) (ids []string, truncated bool, err error) {
+	rows, qerr := db.DB.Query(`
 		SELECT correlation_id FROM command_queue
 		WHERE edge_id = $1
 		  AND state = 'cancelled'
 		  AND delivered_to_endpoint_at IS NULL
 		  AND cancellation_confirmed_at IS NULL
 		ORDER BY terminal_at ASC
-		LIMIT $2`, edgeID, maxCancelSignalBatch)
-	if err != nil {
-		return nil, err
+		LIMIT $2`, edgeID, maxCancelSignalBatch+1)
+	if qerr != nil {
+		return nil, false, qerr
 	}
 	defer rows.Close()
 	out := []string{}
 	for rows.Next() {
 		var cid string
-		if err := rows.Scan(&cid); err != nil {
-			return nil, err
+		if scanErr := rows.Scan(&cid); scanErr != nil {
+			return nil, false, scanErr
 		}
 		out = append(out, cid)
 	}
-	return out, rows.Err()
+	if rerr := rows.Err(); rerr != nil {
+		return nil, false, rerr
+	}
+	if len(out) > maxCancelSignalBatch {
+		return out[:maxCancelSignalBatch], true, nil
+	}
+	return out, false, nil
 }
 
 func postEdgeCommandsAck(c *fiber.Ctx) error {
