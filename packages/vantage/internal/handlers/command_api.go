@@ -277,7 +277,10 @@ func listCommandsHandler(c *fiber.Ctx) error {
 	             queued_at, COALESCE(delivered_to_edge_at, 0), COALESCE(delivered_to_endpoint_at, 0),
 	             COALESCE(terminal_at, 0), expires_at
 	        FROM command_queue ` + where +
-		` ORDER BY queued_at DESC LIMIT $` + strconv.Itoa(len(args)+1) + ` OFFSET $` + strconv.Itoa(len(args)+2)
+		// id DESC tie-breaks rows sharing a (second-granularity) queued_at — a
+		// tag fan-out enqueues many in one second — so limit/offset paging
+		// can't duplicate or skip rows (codex round 5 #1).
+		` ORDER BY queued_at DESC, id DESC LIMIT $` + strconv.Itoa(len(args)+1) + ` OFFSET $` + strconv.Itoa(len(args)+2)
 	rows, err := db.DB.Query(q, limOffArgs...)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "query failed"})

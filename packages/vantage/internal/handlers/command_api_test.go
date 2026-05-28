@@ -310,6 +310,43 @@ func TestCancel_Unknown_404(t *testing.T) {
 	}
 }
 
+// TestListCommands_StablePagination: commands sharing a queued_at second (a
+// tag/multi-endpoint fan-out) must page without dup/skip thanks to the id
+// tie-breaker (codex round 5 #1).
+func TestListCommands_StablePagination(t *testing.T) {
+	app := commandAPIEnv(t, "super_admin")
+	seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
+	// One enqueue → 3 commands, all the same queued_at second.
+	doCmd(t, app, http.MethodPost, "/api/v1/commands", map[string]any{
+		"edge_id": "edge-1", "targets": map[string]any{"kind": "endpoint", "values": []string{"h1", "h2", "h3"}},
+		"command_type": "restart_service", "command_params": map[string]any{"service_name": "nginx"},
+	}).Body.Close()
+
+	seen := map[string]int{}
+	for _, url := range []string{
+		"/api/v1/commands?edge_id=edge-1&limit=2&offset=0",
+		"/api/v1/commands?edge_id=edge-1&limit=2&offset=2",
+	} {
+		resp := doCmd(t, app, http.MethodGet, url, nil)
+		var out struct {
+			Data []CommandRow `json:"data"`
+		}
+		json.NewDecoder(resp.Body).Decode(&out)
+		resp.Body.Close()
+		for _, r := range out.Data {
+			seen[r.CorrelationID]++
+		}
+	}
+	if len(seen) != 3 {
+		t.Errorf("paged distinct correlation_ids=%d, want 3 (no skip)", len(seen))
+	}
+	for cid, n := range seen {
+		if n != 1 {
+			t.Errorf("%s appeared %d times across pages, want 1 (no dup)", cid, n)
+		}
+	}
+}
+
 func TestListCommands_FilterByEdgeAndState(t *testing.T) {
 	app := commandAPIEnv(t, "super_admin")
 	seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
