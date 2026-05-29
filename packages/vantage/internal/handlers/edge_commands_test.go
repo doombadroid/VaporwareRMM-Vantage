@@ -690,6 +690,47 @@ func contains(s, sub string) bool {
 	return false
 }
 
+// TestEdgeEvents_CommandResultAfterCancel_Idempotent: a retried
+// command.result event for the same already-recorded executed_after_cancel
+// row must NOT duplicate the audit (PR #4 codex round 1 #2). The CAS on
+// cancellation_confirmed_at NULL→now succeeds at most once per row, so the
+// forensic audit is written exactly once even under retry storms.
+func TestEdgeEvents_CommandResultAfterCancel_Idempotent(t *testing.T) {
+	app := edgeFederationEnv(t)
+	tok := seedEdgeForPoll(t, "edge-1", "tenant-x", 25*24*time.Hour)
+	now := time.Now().Unix()
+	seedQueuedCommand(t, "cid-eac-dup", "tenant-x", "edge-1", "host-a", now+3600)
+	db.DB.Exec(`UPDATE command_queue SET state='cancelled', terminal_at=$1, delivered_to_endpoint_at=$1 WHERE correlation_id='cid-eac-dup'`, now)
+
+	body := map[string]any{
+		"events": []map[string]any{
+			{"correlation_id": "cid-eac-dup", "type": "command.result", "occurred_at": now,
+				"payload": map[string]string{"status": "succeeded", "message": "first"}},
+		},
+		"audit_chain_head": map[string]any{"seq": 1, "signature": "sig"},
+	}
+	resp1 := postEdgeEventsHTTP(t, app, tok, body)
+	resp1.Body.Close()
+
+	body2 := map[string]any{
+		"events": []map[string]any{
+			{"correlation_id": "cid-eac-dup", "type": "command.result", "occurred_at": now + 1,
+				"payload": map[string]string{"status": "succeeded", "message": "second"}},
+		},
+		"audit_chain_head": map[string]any{"seq": 2, "signature": "sig2"},
+	}
+	resp2 := postEdgeEventsHTTP(t, app, tok, body2)
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Fatalf("retry status=%d", resp2.StatusCode)
+	}
+	var auditN int
+	db.DB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='command.executed_after_cancel' AND resource_id='cid-eac-dup'`).Scan(&auditN)
+	if auditN != 1 {
+		t.Errorf("executed_after_cancel audit count after retry=%d, want 1 (no duplicate)", auditN)
+	}
+}
+
 // TestEdgeEvents_CommandResultBadStatus_Rejected: any status other than
 // succeeded|failed|cancelled is rejected at parse stage.
 func TestEdgeEvents_CommandResultBadStatus_Rejected(t *testing.T) {

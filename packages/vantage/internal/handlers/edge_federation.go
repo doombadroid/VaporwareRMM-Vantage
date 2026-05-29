@@ -310,12 +310,35 @@ func postEdgeEvents(c *fiber.Ctx) error {
 				case terr == nil:
 					// Normal terminal transition applied.
 				case errors.Is(terr, commands.ErrInvalidTransition):
-					var st string
-					qerr := tx.QueryRowContext(ctx,
-						`SELECT state FROM command_queue WHERE correlation_id = $1 AND edge_id = $2`,
-						e.CorrelationID, edgeID,
-					).Scan(&st)
-					if qerr == nil && st == commands.StateCancelled {
+					// Audit idempotency (PR #4 round 1 #2): gate the
+					// executed_after_cancel audit on a CAS-winning
+					// cancellation_confirmed_at UPDATE. Retried command.result
+					// events for the same row would otherwise write a fresh
+					// audit row each time (bloating the hash chain) since the
+					// state-only check below fires repeatedly. The CAS UPDATE
+					// on cancellation_confirmed_at IS NULL succeeds at most
+					// once per (correlation_id, edge_id) pair, so the audit
+					// row is written exactly once for the first observation
+					// of the divergence. Subsequent retries CAS-miss → no
+					// audit, no error (benign idempotent no-op).
+					res, uerr := tx.ExecContext(ctx,
+						`UPDATE command_queue
+						 SET cancellation_confirmed_at = $1
+						 WHERE correlation_id = $2
+						   AND edge_id = $3
+						   AND state = 'cancelled'
+						   AND cancellation_confirmed_at IS NULL`,
+						time.Now().Unix(), e.CorrelationID, edgeID,
+					)
+					if uerr != nil {
+						return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "cancellation confirm update failed"})
+					}
+					ra, _ := res.RowsAffected()
+					if ra > 0 {
+						// First observation of the divergence: record the
+						// forensic audit and the cancellation is now
+						// confirmed so the cancel signal stops replaying
+						// (codex round 6 #3).
 						details, _ := json.Marshal(map[string]string{
 							"agent_status":  p.Status,
 							"agent_message": p.Message,
@@ -323,21 +346,11 @@ func postEdgeEvents(c *fiber.Ctx) error {
 						if aerr := events.AuditLogSyncTx(tx, edgeID, "command.executed_after_cancel", "command", e.CorrelationID, string(details), ""); aerr != nil {
 							return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "audit write failed"})
 						}
-						// Confirm the cancellation so it stops replaying in
-						// the cancel signal (codex round 6 #3). The Edge has
-						// already dispatched and will never send a separate
-						// command.cancellation_confirmed for this row, so the
-						// terminal result IS the confirmation that the cancel
-						// signal is no longer relevant for this Edge.
-						if _, uerr := tx.ExecContext(ctx,
-							`UPDATE command_queue SET cancellation_confirmed_at = $1
-							 WHERE correlation_id = $2 AND edge_id = $3 AND cancellation_confirmed_at IS NULL`,
-							time.Now().Unix(), e.CorrelationID, edgeID,
-						); uerr != nil {
-							return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "cancellation confirm update failed"})
-						}
 					}
-					// Other states fall through as benign no-op.
+					// ra == 0: either the row is not in 'cancelled' state
+					// (other terminal, owned by another Edge, gone) or has
+					// already been confirmed by an earlier observation —
+					// both benign no-ops.
 				case errors.Is(terr, commands.ErrNotFound):
 					// Benign idempotent — row gone.
 				default:
@@ -638,8 +651,15 @@ func pollEdge(c *fiber.Ctx) error {
 	//     surfaces the degraded state to the Edge so it can skip dispatch
 	//     for any commands it already has locally too (codex round 4 #3).
 	//   - Both succeed: both lists are returned; cancel_signal_complete=true.
-	pollNow := time.Now().Unix()
-	pendingCommands, cerr := fetchPendingCommands(edgeID, pollNow)
+	// pollMarker is nanosecond-precision per-call so that two polls within the
+	// same Unix second (e.g., retry, concurrent Edge processes) get different
+	// stamps. Without this, the on-withhold un-stamp's match by
+	// poll_delivered_at = pollMarker could clear an earlier same-second poll's
+	// stamp (codex review of PR #4 round 1 #1). nowSecs stays in seconds for
+	// the ackGraceSeconds expiry filter.
+	pollMarker := time.Now().UnixNano()
+	nowSecs := time.Now().Unix()
+	pendingCommands, cerr := fetchPendingCommands(edgeID, pollMarker, nowSecs)
 	if cerr != nil {
 		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
 		pendingCommands = []pollCommandDTO{}
@@ -659,14 +679,14 @@ func pollEdge(c *fiber.Ctx) error {
 		// round 5 #1). Un-stamp the rows we just stamped this poll so
 		// MarkCancelled's queued+IS NULL guard does not lock out the
 		// operator until the next delivery (codex round 6 #1). The
-		// poll_delivered_at = $2 match catches only the stamps that this
-		// poll's COALESCE wrote (rows that had no prior stamp); previous
-		// stamps from earlier polls are preserved.
+		// poll_delivered_at = $2 match uses the nanosecond pollMarker to
+		// catch ONLY this poll's stamps; earlier same-second polls have
+		// different markers and are preserved (PR #4 round 1 #1).
 		for _, cmd := range pendingCommands {
 			if _, uerr := db.DB.Exec(
 				`UPDATE command_queue SET poll_delivered_at = NULL
 				 WHERE correlation_id = $1 AND state = 'queued' AND poll_delivered_at = $2`,
-				cmd.CorrelationID, pollNow,
+				cmd.CorrelationID, pollMarker,
 			); uerr != nil {
 				slog.Warn("poll: un-stamp poll_delivered_at on withhold",
 					"error", uerr, "correlation_id", cmd.CorrelationID, "edge_id", edgeID)

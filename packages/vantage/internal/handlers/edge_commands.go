@@ -56,10 +56,10 @@ type pollCommandDTO struct {
 // It is a single atomic UPDATE ... RETURNING (codex round 3 #1): the rows it
 // hands out get poll_delivered_at stamped in the SAME statement, so there is
 // no window where a command is delivered but unmarked — MarkCancelled's
-// poll_delivered_at IS NULL guard then can't race a concurrent poll. nowUnix
-// MUST be a fresh time.Now() captured by the caller right before this call
-// (codex round 3 #4) — a stale value could let an already-near-expiry command
-// slip past the grace filter.
+// poll_delivered_at IS NULL guard then can't race a concurrent poll. nowSecs
+// MUST be a fresh time.Now().Unix() captured by the caller right before this
+// call (codex round 3 #4) — a stale value could let an already-near-expiry
+// command slip past the grace filter.
 //
 // The inner CTE selects the rows with FOR UPDATE SKIP LOCKED (so concurrent
 // multi-node polls don't double-hand-out the same row) applying:
@@ -79,9 +79,17 @@ type pollCommandDTO struct {
 // re-polled marker would always be fresh for an actively-polling Edge and
 // the cancel widening would never trigger.
 //
+// Two timestamps are passed (PR #4 codex round 1 #1): pollMarker is a
+// nanosecond-precision per-call value the on-withhold un-stamp matches to
+// prove ownership of the row's stamp. Two polls within the same second
+// (Unix() granularity) would otherwise collide, and a later degraded poll
+// could un-stamp an earlier successful poll's row, making MarkCancelled
+// treat it as never-delivered. nowSecs stays in unix seconds for the
+// ackGraceSeconds filter.
+//
 // The RETURNING order is unspecified but irrelevant (the Edge processes every
 // command).
-func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error) {
+func fetchPendingCommands(edgeID string, pollMarker int64, nowSecs int64) ([]pollCommandDTO, error) {
 	rows, err := db.DB.Query(`
 		WITH picked AS (
 			SELECT correlation_id
@@ -97,7 +105,7 @@ func fetchPendingCommands(edgeID string, nowUnix int64) ([]pollCommandDTO, error
 		FROM picked
 		WHERE c.correlation_id = picked.correlation_id
 		RETURNING c.correlation_id, c.target_endpoint_id, c.command_type, c.command_params`,
-		edgeID, nowUnix, nowUnix+ackGraceSeconds)
+		edgeID, pollMarker, nowSecs+ackGraceSeconds)
 	if err != nil {
 		return nil, err
 	}
