@@ -199,28 +199,6 @@ func cancelCommandHandler(c *fiber.Ctx) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Lock the target edge row to serialize with pollEdge's capability
-	// downgrade UPDATE (codex review of PR #3 round 6 #2). Without this, a
-	// concurrent poll can read supports_cancel_signal=true and our cancel
-	// can commit, while the poll's CASE simultaneously sets it to false
-	// because its EXISTS snapshot pre-dates our cancel — leaving a
-	// terminal-cancelled command queued for an Edge the server now treats
-	// as not supporting the signal. The lookup-then-lock dance is benign
-	// when the correlation_id does not exist (handled as ErrNotFound by
-	// MarkCancelled below); a missing edge_id falls through to MarkCancelled's
-	// classifier without taking the lock.
-	var edgeID string
-	if lookupErr := tx.QueryRowContext(c.UserContext(),
-		`SELECT edge_id FROM command_queue WHERE correlation_id = $1`,
-		correlationID,
-	).Scan(&edgeID); lookupErr == nil && edgeID != "" {
-		if _, lerr := tx.ExecContext(c.UserContext(),
-			`SELECT 1 FROM edges WHERE id = $1 FOR UPDATE`, edgeID,
-		); lerr != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "edge lock failed"})
-		}
-	}
-
 	switch err := commands.MarkCancelled(c.UserContext(), tx, correlationID, userID); {
 	case errors.Is(err, commands.ErrNotFound):
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "command not found"})

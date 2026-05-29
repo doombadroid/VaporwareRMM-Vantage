@@ -227,12 +227,7 @@ func TestEnqueue_InactiveEdge_409(t *testing.T) {
 	}
 }
 
-// TestCancel_DeliveredToEdge_200: F4b restores Decision 6's full cancel window.
-// A command in delivered_to_edge is still pre-dispatch from the endpoint's POV
-// — the Edge has it locally but has not yet handed it to the agent. The cancel
-// signal in the Edge's next poll response tells it to drop the command before
-// dispatch, so Vantage can transition delivered_to_edge → cancelled.
-func TestCancel_DeliveredToEdge_200(t *testing.T) {
+func TestCancel_DeliveredToEdge_409(t *testing.T) {
 	app := commandAPIEnv(t, "super_admin")
 	seedEdgeForPoll(t, "edge-1", "tenant-x", time.Hour)
 	resp := doCmd(t, app, http.MethodPost, "/api/v1/commands", map[string]any{
@@ -245,20 +240,12 @@ func TestCancel_DeliveredToEdge_200(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&enq)
 	resp.Body.Close()
 	cid := enq.CorrelationIDs[0]
-	// Edge acked it (delivered_to_edge). Under F4b this is still cancellable
-	// provided the edge advertised cancel-signal support (default in the test
-	// seed) AND delivered_to_edge_at is outside the stabilization window.
-	past := time.Now().Add(-time.Minute).Unix()
-	db.DB.Exec(`UPDATE command_queue SET state='delivered_to_edge', delivered_to_edge_at=$1 WHERE correlation_id=$2`, past, cid)
+	// Edge acked it (delivered_to_edge) — now no longer cancellable (round 1 #4).
+	db.DB.Exec(`UPDATE command_queue SET state='delivered_to_edge' WHERE correlation_id=$1`, cid)
 	c := doCmd(t, app, http.MethodDelete, "/api/v1/commands/"+cid, nil)
 	defer c.Body.Close()
-	if c.StatusCode != 200 {
-		t.Errorf("cancel delivered_to_edge: status=%d, want 200 (F4b restored window)", c.StatusCode)
-	}
-	var st string
-	db.DB.QueryRow(`SELECT state FROM command_queue WHERE correlation_id=$1`, cid).Scan(&st)
-	if st != "cancelled" {
-		t.Errorf("state after cancel=%s, want cancelled", st)
+	if c.StatusCode != 409 {
+		t.Errorf("cancel delivered_to_edge: status=%d, want 409 (queued-only cancel)", c.StatusCode)
 	}
 }
 

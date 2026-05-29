@@ -297,8 +297,8 @@ func seedEdgeForPoll(t *testing.T, id, tenantID string, expiryFromNow time.Durat
 	if _, err := db.DB.Exec(
 		`INSERT INTO edges
 		     (id, tenant_id, token_hash, token_issued_at, token_expires_at,
-		      edge_version, status, last_seen_at, created_at, supports_cancel_signal)
-		     VALUES ($1, $2, $3, $4, $5, '0.1.0', 'active', $6, $7, true)`,
+		      edge_version, status, last_seen_at, created_at)
+		     VALUES ($1, $2, $3, $4, $5, '0.1.0', 'active', $6, $7)`,
 		id, tenantID, hash, now, expiry, now, now,
 	); err != nil {
 		t.Fatalf("seed edge: %v", err)
