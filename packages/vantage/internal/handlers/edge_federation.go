@@ -27,6 +27,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // Edge bearer-token prefix: "vet_" = "vantage edge token". Visually
@@ -663,6 +664,30 @@ func pollEdge(c *fiber.Ctx) error {
 	if cerr != nil {
 		slog.Error("poll: fetch pending commands", "error", cerr, "edge_id", edgeID)
 		pendingCommands = []pollCommandDTO{}
+	}
+	// Drain pending cancellations on the just-returned rows before reading
+	// the cancel signal (PR #4 round 2 #1). fetchPendingCommands holds row
+	// locks only for the duration of its atomic UPDATE; an operator
+	// MarkCancelled racing the same row may have been blocked on that lock
+	// and committed AFTER we autocommitted but BEFORE our SELECT on
+	// cancelled correlation_ids ran. A SELECT … FOR UPDATE on the returned
+	// correlation_ids re-acquires the lock — Postgres makes us wait for any
+	// pending UPDATE to commit first, so the subsequent cancelled-read
+	// observes those cancels. The lock is released at statement end
+	// (autocommit) so there is no holding cost beyond the drain itself.
+	if len(pendingCommands) > 0 {
+		drainIDs := make([]string, len(pendingCommands))
+		for i, cmd := range pendingCommands {
+			drainIDs[i] = cmd.CorrelationID
+		}
+		if dRows, derr := db.DB.Query(
+			`SELECT 1 FROM command_queue WHERE correlation_id = ANY($1) FOR UPDATE`,
+			pq.Array(drainIDs),
+		); derr != nil {
+			slog.Warn("poll: drain racing cancellations", "error", derr, "edge_id", edgeID)
+		} else {
+			_ = dRows.Close()
+		}
 	}
 	cancelledIDs, cancelTruncated, ccerr := fetchCancelledCorrelationIDs(edgeID)
 	cancelSignalComplete := ccerr == nil && !cancelTruncated
